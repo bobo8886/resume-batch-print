@@ -1,0 +1,86 @@
+name: 🐛 Bug 报告
+description: 打不出来 / 界面报错 / 行为不符合预期
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！这个工具最容易出问题的地方是**打印机选择**，先花 10 秒确认一下：
+
+        - 右侧「打印机」下面那行写的是 **可出纸** 还是 **虚拟打印机**？
+          `Microsoft Print to PDF` / `OneNote` / `导出为 WPS PDF` 都是**不会出纸**的虚拟打印机。
+        - 点过一次 **「打印测试页」** 吗？出纸了吗？
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 越具体越好。比如"点了打印，进度条走完显示 ✔，但打印机没动"
+      placeholder: |
+        我做了什么：
+        我期望：
+        实际结果：
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 双击 一键打印简历.bat
+        2. 选择文件夹 D:\xxx
+        3. 点「一键打印」
+        4. ...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: 页面右上角三个状态灯分别是什么颜色？
+      multiple: true
+      options:
+        - PDF 已就绪（绿）
+        - PDF 缺失（红）
+        - Word 可用（绿）
+        - Word 不可用（红）
+        - Word 未安装（灰）
+        - WPS 可用（绿）
+        - WPS 不可用（红）
+        - WPS 未安装（灰）
+        - 没注意
+
+  - type: input
+    id: printer
+    attributes:
+      label: 用的是哪台打印机
+      placeholder: 例如 Canon TS300 series（USB001）
+    validations:
+      required: false
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      placeholder: 例如 Windows 11 23H2 / Windows 10 22H2 / Windows 7 SP1
+    validations:
+      required: true
+
+  - type: textarea
+    id: console
+    attributes:
+      label: 黑窗口里的输出
+      description: 把那个黑色命令行窗口里的文字整段复制过来，报错信息非常关键
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息
+      description: 截图（注意马赛克掉简历内容和真实姓名）、文件类型（PDF / Word）、简历是扫描件还是文字版等
+    validations:
+      required: false

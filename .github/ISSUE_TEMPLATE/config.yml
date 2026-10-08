@@ -1,0 +1,8 @@
+﻿blank_issues_enabled: false
+contact_links:
+  - name: 🔒 报告安全问题
+    url: https://github.com/bobo8886/resume-batch-print/security/advisories/new
+    about: 安全漏洞请走私密渠道，不要开公开 issue（详见 SECURITY.md）
+  - name: 📖 先看使用说明
+    url: https://github.com/bobo8886/resume-batch-print/blob/main/README.md
+    about: 常见问题（字很淡、虚拟打印机不出纸、Word 打不了）README 里都有

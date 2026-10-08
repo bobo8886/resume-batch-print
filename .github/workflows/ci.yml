@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试 (Windows PowerShell 5.1)
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 环境信息
+        shell: powershell
+        run: |
+          $PSVersionTable | Out-String | Write-Host
+          [Environment]::OSVersion.VersionString | Write-Host
+
+      - name: 安装 PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+
+      - name: 静态分析 (PSScriptAnalyzer)
+        shell: powershell
+        run: |
+          $settings = Join-Path $PWD 'tools\PSScriptAnalyzerSettings.psd1'
+          $results = Invoke-ScriptAnalyzer -Path '.\server.ps1' -Settings $settings
+          if ($results) {
+            $results | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap | Out-String | Write-Host
+          } else {
+            Write-Host 'PSScriptAnalyzer: 没有问题'
+          }
+          $errors = @($results | Where-Object { $_.Severity -eq 'Error' })
+          if ($errors.Count -gt 0) {
+            Write-Host ("发现 " + $errors.Count + " 个 Error 级问题") -ForegroundColor Red
+            exit 1
+          }
+
+      - name: 运行测试套件
+        shell: powershell
+        run: |
+          & .\tests\run-tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 检查是否误提交了隐私文件
+        shell: powershell
+        run: |
+          $bad = @()
+          foreach ($p in @('config.json', '打印记录\printed.json', 'bin\SumatraPDF.exe')) {
+            if (Test-Path $p) { $bad += $p }
+          }
+          if ($bad.Count -gt 0) {
+            Write-Host ("以下文件不该出现在仓库里: " + ($bad -join ', ')) -ForegroundColor Red
+            exit 1
+          }
+          Write-Host '没有误提交隐私文件 / 大二进制'

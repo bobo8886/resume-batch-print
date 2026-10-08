@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>简历一键打印</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">🖨️</div>
+    <div class="brand-txt">
+      <h1>简历一键打印</h1>
+      <p>批量打印面试简历 · PDF / Word 都能打 · 免安装</p>
+    </div>
+  </div>
+  <div class="engines" id="engines"></div>
+</header>
+
+<div class="layout">
+
+  <!-- ================= 左：主内容 ================= -->
+  <main class="main">
+
+    <div id="engineBanner" class="banner" hidden>
+      <div class="banner-ico">📦</div>
+      <div class="banner-txt">
+        <b>还缺一个 PDF 打印引擎</b>
+        <span>PDF 简历需要它才能静默打印。点右边的按钮自动下载并做 SHA-256 校验，只需一次，之后离线可用。</span>
+      </div>
+      <button id="btnFetchEngine" class="btn primary">下载 PDF 引擎</button>
+    </div>
+
+    <section class="card">
+      <div class="card-head">
+        <span class="step">1</span>
+        <h2>选择简历文件夹</h2>
+        <span class="head-hint" id="scanHint">支持 PDF / Word / RTF / TXT</span>
+      </div>
+      <div class="card-body">
+        <div class="field-row">
+          <div class="input-wrap">
+            <span class="input-ico">📁</span>
+            <input id="folder" type="text" placeholder="粘贴文件夹路径，或点右边「浏览」选择" spellcheck="false" list="folderList">
+          </div>
+          <datalist id="folderList"></datalist>
+          <button id="btnBrowse" class="btn ghost">浏览…</button>
+          <button id="btnScan" class="btn primary">扫描</button>
+        </div>
+        <label class="switch">
+          <input id="recursive" type="checkbox" checked>
+          <span class="track"><span class="knob"></span></span>
+          <span class="switch-txt">包含子文件夹</span>
+        </label>
+      </div>
+    </section>
+
+    <section class="card" id="filesCard" hidden>
+      <div class="card-head">
+        <span class="step">2</span>
+        <h2>勾选要打印的简历</h2>
+        <span class="head-hint" id="count">已选 0 / 0</span>
+      </div>
+      <div class="card-body">
+        <div class="toolbar">
+          <div class="search-wrap">
+            <span class="input-ico">🔍</span>
+            <input id="search" type="search" placeholder="按文件名搜索…" spellcheck="false">
+          </div>
+          <div class="segs">
+            <button class="seg" data-sel="all">全选</button>
+            <button class="seg" data-sel="none">全不选</button>
+            <button class="seg" data-sel="invert">反选</button>
+            <button class="seg" data-sel="pdf">仅 PDF</button>
+            <button class="seg" data-sel="word">仅 Word</button>
+          </div>
+          <label class="switch mini">
+            <input id="onlyUnprinted" type="checkbox">
+            <span class="track"><span class="knob"></span></span>
+            <span class="switch-txt">只看没打过的</span>
+          </label>
+        </div>
+        <div class="tablewrap">
+          <table id="tbl">
+            <thead>
+              <tr>
+                <th class="c-check"><input id="checkAll" type="checkbox"></th>
+                <th class="c-idx">#</th>
+                <th>文件名</th>
+                <th class="c-ext">类型</th>
+                <th class="c-size">大小</th>
+                <th class="c-time">修改时间</th>
+                <th class="c-done">状态</th>
+                <th class="c-act"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div id="emptyHint" class="empty" hidden>
+          <div class="empty-ico">🗂️</div>
+          <p>这个文件夹里还没有可打印的简历</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card card-placeholder" id="placeholder">
+      <div class="card-body ph-body">
+        <div class="ph-ico">📄</div>
+        <h3>还没有选择文件夹</h3>
+        <p>选好存放简历的文件夹后，这里会列出所有简历并自动勾选。</p>
+        <button class="btn primary" id="btnBrowse2">浏览文件夹…</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ================= 右：打印设置 ================= -->
+  <aside class="side">
+    <section class="card sticky">
+      <div class="card-head">
+        <span class="step">3</span>
+        <h2>打印机与份数</h2>
+      </div>
+      <div class="card-body">
+
+        <label class="lbl">打印机</label>
+        <select id="printer"></select>
+        <p class="printer-info" id="printerInfo"></p>
+        <div id="printerWarn" class="warnbar" hidden></div>
+
+        <label class="lbl mt">每份打印份数</label>
+        <div class="stepper">
+          <button id="cpMinus" class="step-btn">−</button>
+          <input id="copies" type="number" min="1" max="99" value="1">
+          <button id="cpPlus" class="step-btn">+</button>
+        </div>
+
+        <label class="lbl mt">打印浓度</label>
+        <select id="enhance">
+          <option value="auto">自动（推荐）</option>
+          <option value="normal">标准 · 原样打印</option>
+          <option value="dark">加深 · 适合浅色简历</option>
+          <option value="darker">强力加深 · 适合很淡的扫描件</option>
+        </select>
+        <p class="printer-info" id="enhanceInfo"></p>
+
+        <label class="switch mt">
+          <input id="dryRun" type="checkbox">
+          <span class="track"><span class="knob"></span></span>
+          <span class="switch-txt">试运行（只演示，不真的打印）</span>
+        </label>
+
+        <div class="summary" id="summary">
+          <div class="sum-row"><span>已勾选</span><b id="sumCount">0 份</b></div>
+          <div class="sum-row"><span>其中</span><b id="sumMix">—</b></div>
+        </div>
+
+        <button id="btnPrint" class="btn print">🖨️ 一键打印</button>
+        <div class="side-actions">
+          <button id="btnTest" class="btn ghost small">打印测试页</button>
+          <button id="btnRetest" class="btn ghost small">重新检测</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card tips">
+      <div class="card-head"><h2>💡 使用提示</h2></div>
+      <div class="card-body">
+        <ul class="tip-list">
+          <li>第一次用先点一次 <b>打印测试页</b>，确认打印机通了再批量打。</li>
+          <li><b>PDF 和 Word 混在一起</b>也能一次打完，工具会自动挑合适的引擎。</li>
+          <li>打完的简历会记进<b>打印记录</b>，配合「只看没打过的」可避免重复打印。</li>
+          <li>面试官多的时候把<b>份数</b>设成人数，每份简历就各打那么多份。</li>
+          <li>点「打印测试页」上面那行会告诉你当前打印机<b>会不会出纸</b>。</li>
+        </ul>
+      </div>
+    </section>
+  </aside>
+
+</div>
+
+<!-- ================= 打印进度 ================= -->
+<div id="overlay" class="overlay" hidden>
+  <div class="modal">
+    <h2 id="ovTitle">正在打印…</h2>
+    <div class="progress"><div id="bar"></div></div>
+    <p id="ovStat" class="ovstat"></p>
+    <div id="log" class="log"></div>
+    <div class="modal-foot">
+      <button id="btnStop" class="btn ghost">停止</button>
+      <button id="btnOpenRec" class="btn ghost">打开打印记录</button>
+      <button id="btnClose" class="btn primary" hidden>关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 文件夹浏览器 ================= -->
+<div id="picker" class="overlay" hidden>
+  <div class="modal picker">
+    <h2>选择简历文件夹</h2>
+    <div class="pk-nav">
+      <button id="pkUp" class="btn ghost small">↑ 上一级</button>
+      <div class="input-wrap">
+        <span class="input-ico">📁</span>
+        <input id="pkPath" type="text" spellcheck="false" placeholder="也可以直接粘贴路径后回车">
+      </div>
+      <button id="pkGo" class="btn ghost small">转到</button>
+    </div>
+    <div id="pkCrumbs" class="pk-crumbs"></div>
+    <div id="pkList" class="pk-list"></div>
+    <p id="pkErr" class="pk-err"></p>
+    <div class="modal-foot">
+      <button id="pkCancel" class="btn ghost">取消</button>
+      <button id="pkOk" class="btn primary">就用这个文件夹</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
