@@ -246,6 +246,14 @@ try {
     $st = Api 'POST' '/api/selftest' @{}
     Check '/api/selftest 返回引擎报告' ($null -ne $st.engines)
 
+    # 自检之后引擎状态才会变成真实结果，这里必须重新取一次 info，
+    # 否则拿到的是"还没检测"的旧值（全 false）。
+    $info = Api 'GET' '/api/info'
+    if ($hasEngine) {
+        Check '自检后引擎被标记为可用' ($info.engines.sumatra -eq $true) '有引擎但报告不可用'
+    }
+    Check '自检后 tested = true' ($info.engines.tested -eq $true) 'selftest 没有回写状态'
+
     $dir = Api 'POST' '/api/list-dir' @{ path = '' }
     Check '/api/list-dir 根目录返回驱动器' ((@($dir.drives)).Count -gt 0)
     Check '/api/list-dir 返回快捷入口' ((@($dir.shortcuts)).Count -gt 0)
@@ -264,19 +272,41 @@ try {
     $pdf = @($scan.files | Where-Object { $_.ext -eq '.pdf' })[0]
     $docx = @($scan.files | Where-Object { $_.ext -eq '.docx' })[0]
 
+    # 这台机器到底有什么引擎？（CI 的裸 runner 上可能一个都没有，那就要断言"明确报错"）
+    $anyPdf = ($info.engines.sumatra -eq $true)
+    $anyOffice = (($info.engines.word -eq $true) -or ($info.engines.wps -eq $true))
+    $anyEngine = ($anyPdf -or $anyOffice)
+    Write-Host ("        可用引擎: PDF=" + $anyPdf + " Office=" + $anyOffice + "  (加深通道=" + $info.enhanceAvailable + ")") -ForegroundColor DarkGray
+
     $dry = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = ''; copies = 1; dryRun = $true; enhance = 'auto' }
-    Check '试运行 PDF 返回成功' ($dry.ok -eq $true) $dry.detail
-    Check '试运行不会真的打印' ($dry.detail -match '试运行')
-    if ($hasEngine -or $info.engines.word -or $info.engines.wps) {
+    if ($anyEngine) {
+        Check '试运行 PDF 返回成功' ($dry.ok -eq $true) $dry.detail
+        Check '试运行不会真的打印' ($dry.detail -match '试运行')
         Check '试运行给出了打印方式' (-not [string]::IsNullOrWhiteSpace($dry.method)) 'method 为空'
+    } else {
+        Check '无任何引擎时 PDF 明确报错' ($dry.ok -eq $false -and $dry.detail -match '没有可用的打印引擎') $dry.detail
     }
 
     $dry2 = Api 'POST' '/api/print-one' @{ path = $docx.path; printer = ''; copies = 3; dryRun = $true; enhance = 'auto' }
-    Check '试运行 Word 文档返回成功' ($dry2.ok -eq $true) $dry2.detail
+    if ($anyOffice) {
+        Check '试运行 Word 文档返回成功' ($dry2.ok -eq $true) $dry2.detail
+    } else {
+        Check '无 Word/WPS 时 Word 文档明确报错' ($dry2.ok -eq $false) $dry2.detail
+    }
 
+    # 「加深」通道最终仍要靠 SumatraPDF 出纸，没有它就必须报错，不能给假阳性
     foreach ($mode in @('auto', 'normal', 'dark', 'darker')) {
         $r = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = ''; copies = 1; dryRun = $true; enhance = $mode }
-        Check "打印浓度 $mode 可用" ($r.ok -eq $true) $r.detail
+        if ($anyEngine) {
+            Check "打印浓度 $mode 可用" ($r.ok -eq $true) $r.detail
+        } else {
+            Check "无引擎时打印浓度 $mode 明确报错" ($r.ok -eq $false) $r.detail
+        }
+    }
+    if ($anyPdf -or $anyOffice) {
+        # 有引擎时，试运行的结果必须是"真的能打"的那条路径
+        $r = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = ''; copies = 1; dryRun = $true; enhance = 'auto' }
+        Check '试运行给出的方式不是空壳' (-not [string]::IsNullOrWhiteSpace($r.method)) 'method 为空'
     }
 
     $bad = Api 'POST' '/api/print-one' @{ path = 'C:\Windows\win.ini'; printer = ''; copies = 1; dryRun = $true }

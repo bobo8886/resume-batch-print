@@ -890,7 +890,11 @@ function Invoke-PrintFile {
             'darker' { $useEnh = $true; $gamma = 2.6 }
             default { if (Test-ImagePdf $Path) { $useEnh = $true; $gamma = 2.0 } }
         }
-        if ($useEnh -and (Initialize-WinRt)) { $plan += ('enh:' + $gamma.ToString([System.Globalization.CultureInfo]::InvariantCulture)) }
+        # 注意：「加深」通道是自己渲染 + 重建 PDF，最终仍然要靠 SumatraPDF 出纸，
+        # 所以 SumatraPDF 不在时不能把它算作可用，否则试运行会给出假阳性。
+        if ($useEnh -and $script:EngineStatus.sumatra -and (Initialize-WinRt)) {
+            $plan += ('enh:' + $gamma.ToString([System.Globalization.CultureInfo]::InvariantCulture))
+        }
         if ($script:EngineStatus.sumatra) { $plan += 'sumatra' }
         foreach ($prog in $usable) { $plan += ('office:' + $prog) }
     } else {
