@@ -6,6 +6,7 @@
 **PDF 和 Word 都能打。** 免安装、免联网（首次下载一次引擎）、不需要 Python / Node，
 **整个文件夹拷到任何 Windows 电脑上都能直接用**。
 
+[![CI](https://github.com/bobo8886/resume-batch-print/actions/workflows/ci.yml/badge.svg)](https://github.com/bobo8886/resume-batch-print/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%207%2B-0078d4.svg)](#环境要求)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE.svg)](#环境要求)
@@ -130,6 +131,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File server.ps1
 目前只认 PDF 和 Word 系文档。
 
 更多问题见 [使用说明.md](使用说明.md)。
+
+### 网络问题：`git clone` / `git push` 卡住或被重置
+
+在国内访问 `github.com` 的 git 通道经常被重置（报 `Connection was reset` /
+`Recv failure`），但 `api.github.com` 通常是通的。加这一行往往就能解决：
+
+```powershell
+git config --global http.version HTTP/1.1
+```
+
+如果还是不行，给 git 挂个代理：
+
+```powershell
+git config --global http.proxy http://127.0.0.1:7890   # 端口改成你自己的
+git config --global https.proxy http://127.0.0.1:7890
+```
+
+只想下载来用的话，直接去 [Releases](../../releases) 拿完整包最省事（不用 clone）。
 
 ---
 
