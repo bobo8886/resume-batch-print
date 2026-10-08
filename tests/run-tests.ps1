@@ -83,6 +83,44 @@ foreach ($f in $ps1Files) {
 }
 
 # ============================================================
+Section '静态检查：workflow 的 run: 块必须是纯 ASCII'
+# ============================================================
+# 这个坑踩过一次：GitHub Actions 会把 `run:` 的内容写成**不带 BOM** 的 .ps1，
+# Windows PowerShell 5.1 遇到无 BOM 的 UTF-8 会按 ANSI/GBK 解码，
+# 中文直接变乱码并语法报错（CI 上表现为 "Unexpected token ..."）。
+# 所以 run: 里只能写 ASCII；带中文的逻辑要放进仓库脚本（那些文件带 BOM）。
+
+$wfDir = Join-Path $RepoRoot '.github\workflows'
+$wfFiles = @(Get-ChildItem -LiteralPath $wfDir -Filter '*.yml' -File -ErrorAction SilentlyContinue)
+Check '能找到 workflow 文件' ($wfFiles.Count -gt 0) ('目录: ' + $wfDir)
+
+foreach ($wf in $wfFiles) {
+    $lines = @(Get-Content -LiteralPath $wf.FullName -Encoding UTF8)
+    $bad = @()
+    $inRunBlock = $false
+    $runIndent = 0
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]
+        if (-not $inRunBlock) {
+            if ($ln -match '^(\s*)run:\s*[|>]\s*$') {
+                $inRunBlock = $true
+                $runIndent = $Matches[1].Length
+                continue
+            }
+            if ($ln -match '^\s*run:\s*(.+)$') {
+                if ($Matches[1] -match '[^\x00-\x7F]') { $bad += ('行' + ($i + 1) + ': ' + $Matches[1].Trim()) }
+            }
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+        $ind = $ln.Length - $ln.TrimStart().Length
+        if ($ind -le $runIndent) { $inRunBlock = $false; $i--; continue }
+        if ($ln -match '[^\x00-\x7F]') { $bad += ('行' + ($i + 1) + ': ' + $ln.Trim()) }
+    }
+    Check ("run: 块纯 ASCII: " + $wf.Name) ($bad.Count -eq 0) (($bad | Select-Object -First 5) -join '  |  ')
+}
+
+# ============================================================
 Section '静态检查：隐私与密钥'
 # ============================================================
 
