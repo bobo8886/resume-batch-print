@@ -210,6 +210,52 @@ New-Item -ItemType Directory -Path $resume -Force | Out-Null
 'c' | Out-File (Join-Path $resume 'c-不是简历.txt.exe') -Encoding utf8
 'd' | Out-File (Join-Path $resume 'd-忽略我.xlsx') -Encoding utf8
 
+# 页范围功能必须要有真实页数才测得准，所以造一份真的多页 PDF
+function Add-Bytes($stream, [byte[]]$bytes) { $stream.Write($bytes, 0, $bytes.Length) }
+
+function New-TestPdf([string]$Path, [int]$PageCount) {
+    $enc = [System.Text.Encoding]::ASCII
+    $objs = New-Object System.Collections.Generic.List[byte[]]
+    $fontId = 3 + $PageCount * 2
+    $kids = (0..($PageCount - 1) | ForEach-Object { "$(3 + $_ * 2) 0 R" }) -join ' '
+
+    $objs.Add($enc.GetBytes('<< /Type /Catalog /Pages 2 0 R >>'))
+    $objs.Add($enc.GetBytes("<< /Type /Pages /Count $PageCount /Kids [$kids] >>"))
+    for ($i = 0; $i -lt $PageCount; $i++) {
+        $contId = 3 + $i * 2 + 1
+        $objs.Add($enc.GetBytes("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 $fontId 0 R >> >> /Contents $contId 0 R >>"))
+        $cb = $enc.GetBytes("BT /F1 24 Tf 72 700 Td (Page $($i + 1)) Tj ET`n")
+        $head = $enc.GetBytes("<< /Length $($cb.Length) >>`nstream`n")
+        $tail = $enc.GetBytes("`nendstream")
+        $all = New-Object byte[] ($head.Length + $cb.Length + $tail.Length)
+        [Array]::Copy($head, 0, $all, 0, $head.Length)
+        [Array]::Copy($cb, 0, $all, $head.Length, $cb.Length)
+        [Array]::Copy($tail, 0, $all, $head.Length + $cb.Length, $tail.Length)
+        $objs.Add($all)
+    }
+    $objs.Add($enc.GetBytes('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'))
+
+    $ms = New-Object System.IO.MemoryStream
+    Add-Bytes $ms $enc.GetBytes("%PDF-1.4`n")
+    $offsets = @()
+    for ($i = 0; $i -lt $objs.Count; $i++) {
+        $offsets += $ms.Length
+        Add-Bytes $ms $enc.GetBytes("$(($i + 1)) 0 obj`n")
+        Add-Bytes $ms $objs[$i]
+        Add-Bytes $ms $enc.GetBytes("`nendobj`n")
+    }
+    $xref = $ms.Length
+    Add-Bytes $ms $enc.GetBytes("xref`n0 $(($objs.Count + 1))`n0000000000 65535 f `n")
+    foreach ($o in $offsets) { Add-Bytes $ms $enc.GetBytes($o.ToString('0000000000') + " 00000 n `n") }
+    Add-Bytes $ms $enc.GetBytes("trailer`n<< /Size $(($objs.Count + 1)) /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
+    [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+    $ms.Dispose()
+}
+
+$multiPdf = Join-Path $resume 'e-多页简历-5页.pdf'
+New-TestPdf -Path $multiPdf -PageCount 5
+Check '测试素材：能生成 5 页 PDF' (Test-Path $multiPdf)
+
 # ============================================================
 Section '启动服务'
 # ============================================================
@@ -303,7 +349,7 @@ try {
     Check '/api/list-dir 对不存在目录返回错误' ($dirBad.ok -eq $false -and $dirBad.error)
 
     $scan = Api 'POST' '/api/scan' @{ folder = $resume; recursive = $true }
-    Check '/api/scan 只认支持的格式' ((@($scan.files)).Count -eq 2) ('实际 ' + (@($scan.files)).Count + ' 个（应为 2）')
+    Check '/api/scan 只认支持的格式' ((@($scan.files)).Count -eq 3) ('实际 ' + (@($scan.files)).Count + ' 个（应为 3）')
     Check '/api/scan 统计被忽略的文件' ($scan.otherCount -eq 2) ('otherCount=' + $scan.otherCount)
     Check '/api/scan 默认标记为未打印' (@($scan.files | Where-Object { $_.printed }).Count -eq 0)
 
@@ -345,6 +391,71 @@ try {
         # 有引擎时，试运行的结果必须是"真的能打"的那条路径
         $r = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = ''; copies = 1; dryRun = $true; enhance = 'auto' }
         Check '试运行给出的方式不是空壳' (-not [string]::IsNullOrWhiteSpace($r.method)) 'method 为空'
+    }
+
+    # --------------------------------------------------------
+    Section '页数统计与选页打印'
+    # --------------------------------------------------------
+
+    $multi = @($scan.files | Where-Object { $_.name -eq 'e-多页简历-5页.pdf' })[0]
+    Check '扫描结果里能找到那份 5 页 PDF' ($null -ne $multi) '没找到测试素材'
+
+    if ($multi) {
+        $pc = Api 'POST' '/api/pagecount' @{ path = $multi.path }
+        Check '/api/pagecount 读出 5 页' ($pc.ok -eq $true -and $pc.count -eq 5) ('ok=' + $pc.ok + ' count=' + $pc.count)
+
+        $pcBad = Api 'POST' '/api/pagecount' @{ path = 'C:\Windows\win.ini' }
+        Check '/api/pagecount 拒绝白名单外的文件' ($pcBad.ok -eq $false)
+
+        # ---- 错误的页码范围必须被拒绝（与有没有引擎无关，校验发生在更早）----
+        $badCases = @(
+            @{ spec = '0';    why = '第 0 页' },
+            @{ spec = '6';    why = '超出 5 页' },
+            @{ spec = '1-9';  why = '区间超出' },
+            @{ spec = 'abc';  why = '不是数字' },
+            @{ spec = '1-';   why = '残缺区间' },
+            @{ spec = '1,,2'; why = '空项' }
+        )
+        foreach ($c in $badCases) {
+            $r = Api 'POST' '/api/print-one' @{ path = $multi.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = $c.spec }
+            Check ("非法页码被拒绝：" + $c.spec + "（" + $c.why + "）") ($r.ok -eq $false) ('竟然通过了：' + $r.detail)
+        }
+
+        # ---- 合法页码范围：被接受，并且被规范化 ----
+        $okCases = @(
+            @{ spec = '1';        want = '1' },
+            @{ spec = '2-4';      want = '2-4' },
+            @{ spec = '5,1-3';    want = '1-3,5' },
+            @{ spec = '3-1';      want = '1-3' },
+            @{ spec = 'odd';      want = '1,3,5' },
+            @{ spec = 'even';     want = '2,4' },
+            @{ spec = 'last';     want = '5' },
+            @{ spec = '-1';       want = '5' },
+            @{ spec = ' 2 , 4 ';  want = '2,4' }
+        )
+        foreach ($c in $okCases) {
+            $r = Api 'POST' '/api/print-one' @{ path = $multi.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = $c.spec }
+            if ($anyEngine) {
+                Check ("页码 " + $c.spec + " -> " + $c.want) ($r.ok -eq $true -and $r.pages -eq $c.want) ('ok=' + $r.ok + ' pages=' + $r.pages + ' detail=' + $r.detail)
+            } else {
+                # 没引擎时也要证明"页码本身是被接受的"，报错必须是引擎问题而不是页码问题
+                Check ("无引擎时页码 " + $c.spec + " 仍被正确解析") ($r.detail -match '没有可用的打印引擎') $r.detail
+            }
+        }
+
+        # ---- 超过首页的页码 + 允许裁剪：批量套用时的行为 ----
+        $clamp = Api 'POST' '/api/print-one' @{ path = $multi.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = '1-9'; pagesClamp = $true }
+        if ($anyEngine) {
+            Check '批量套用时越界页被裁掉（1-9 -> 1-5）' ($clamp.ok -eq $true -and $clamp.pages -eq '1-5') ('ok=' + $clamp.ok + ' pages=' + $clamp.pages)
+        } else {
+            Check '无引擎时裁剪模式仍先解析页码' ($clamp.detail -match '没有可用的打印引擎') $clamp.detail
+        }
+        $clampNone = Api 'POST' '/api/print-one' @{ path = $multi.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = '9'; pagesClamp = $true }
+        Check '裁剪模式下一页都不剩仍然报错' ($clampNone.ok -eq $false) ('竟然通过了：' + $clampNone.detail)
+
+        # ---- 试运行要把页范围写进 detail，方便用户核对 ----
+        $d = Api 'POST' '/api/print-one' @{ path = $multi.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = '2-3' }
+        if ($anyEngine) { Check '试运行 detail 里写明了页范围' ($d.detail -match '第 2-3 页') $d.detail }
     }
 
     $bad = Api 'POST' '/api/print-one' @{ path = 'C:\Windows\win.ini'; printer = ''; copies = 1; dryRun = $true }

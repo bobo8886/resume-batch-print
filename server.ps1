@@ -677,13 +677,19 @@ function Get-OfficeApp([string]$ProgId) {
 # ============================ 打印实现 ============================
 
 function Invoke-SumatraPrint {
-    param([string]$Path, [string]$Printer, [int]$Copies)
+    param([string]$Path, [string]$Printer, [int]$Copies, [string]$Pages = '')
     $engine = $script:SumatraPath
     if (-not (Test-Path $engine)) { throw '未找到 PDF 静默打印引擎 bin\SumatraPDF.exe' }
+
+    # -print-settings 是逗号分隔的令牌列表，页范围（如 1-3,5）本身就是令牌之一
+    $settings = @()
+    if (-not [string]::IsNullOrWhiteSpace($Pages)) { $settings += $Pages.Trim() }
+    if ($Copies -gt 1) { $settings += ($Copies.ToString([System.Globalization.CultureInfo]::InvariantCulture) + 'x') }
+
     $sb = New-Object System.Text.StringBuilder
     if ($Printer) { [void]$sb.Append('-print-to "' + $Printer + '" ') } else { [void]$sb.Append('-print-to-default ') }
     [void]$sb.Append('-silent ')
-    if ($Copies -gt 1) { [void]$sb.Append('-print-settings "' + $Copies + 'x" ') }
+    if ($settings.Count -gt 0) { [void]$sb.Append('-print-settings "' + ($settings -join ',') + '" ') }
     [void]$sb.Append('-exit-when-done ')
     [void]$sb.Append('"' + $Path + '"')
     $argString = $sb.ToString()
@@ -710,7 +716,7 @@ function Set-OfficePrinter($App, [string]$Printer) {
 }
 
 function Invoke-OfficePrint {
-    param([string]$ProgId, [string]$Path, [string]$Printer, [int]$Copies)
+    param([string]$ProgId, [string]$Path, [string]$Printer, [int]$Copies, [string]$Pages = '')
     $label = if ($ProgId -like '*KWPS*') { 'WPS' } else { 'Word' }
     $app = Get-OfficeApp $ProgId
     $docs = [Disp]::Get($app, 'Documents')
@@ -722,7 +728,11 @@ function Invoke-OfficePrint {
     try {
         $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true)
         if ($null -eq $doc) { throw "$label 打不开这个文件" }
-        if ($Copies -gt 1) {
+        if (-not [string]::IsNullOrWhiteSpace($Pages)) {
+            # PrintOut(Background, Append, Range=4(wdPrintRangeOfPages), OutputFileName,
+            #         From, To, Item, Copies, Pages)
+            [Disp]::Call($doc, 'PrintOut', $false, $false, 4, '', 0, 0, 0, $Copies, $Pages.Trim()) | Out-Null
+        } elseif ($Copies -gt 1) {
             [Disp]::Call($doc, 'PrintOut', $false, $false, 0, '', 0, 0, 0, $Copies) | Out-Null
         } else {
             [Disp]::Call($doc, 'PrintOut', $false) | Out-Null
@@ -730,7 +740,8 @@ function Invoke-OfficePrint {
     } finally {
         if ($doc) { try { [Disp]::Call($doc, 'Close', 0) | Out-Null } catch { } }
     }
-    return "$label 已送出 $Copies 份"
+    if ([string]::IsNullOrWhiteSpace($Pages)) { return "$label 已送出 $Copies 份" }
+    return "$label 已送出 $Copies 份（第 $Pages 页）"
 }
 
 function Convert-OfficeToPdf {
@@ -802,15 +813,20 @@ function Test-ImagePdf([string]$Path) {
 }
 
 function ConvertTo-EnhancedPdf {
-    param([string]$Path, [double]$Gamma = 2.0)
+    param([string]$Path, [double]$Gamma = 2.0, [int[]]$PageIndexes = $null)
     if (-not (Initialize-WinRt)) { throw '本机不支持内置 PDF 渲染（需要 Windows 10 及以上）' }
     $out = Join-Path $TempDir ([guid]::NewGuid().ToString('N') + '_enh.pdf')
     $doc = $null
     try {
         $file = Await-WinRtOp ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
         $doc = Await-WinRtOp ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+
+        # 没指定就全打；指定了就只渲染这几页（0 基），并保持用户给的顺序
+        $want = if ($null -ne $PageIndexes -and $PageIndexes.Count -gt 0) { $PageIndexes } else { @(0..([int]$doc.PageCount - 1)) }
+
         $builder = New-Object EnhPdf+Builder
-        for ($i = 0; $i -lt $doc.PageCount; $i++) {
+        foreach ($i in $want) {
+            if ($i -lt 0 -or $i -ge $doc.PageCount) { continue }
             $page = $doc.GetPage([uint32]$i)
             $pwpt = [double]$page.Size.Width * 0.75     # WinRT 给的是 DIP，换算成 pt
             $phpt = [double]$page.Size.Height * 0.75
@@ -846,19 +862,151 @@ function ConvertTo-EnhancedPdf {
 }
 
 function Invoke-PdfEnhancedPrint {
-    param([string]$Path, [string]$Printer, [int]$Copies, [double]$Gamma)
-    $tmp = ConvertTo-EnhancedPdf -Path $Path -Gamma $Gamma
+    param([string]$Path, [string]$Printer, [int]$Copies, [double]$Gamma, [int[]]$PageIndexes = $null)
+    $tmp = ConvertTo-EnhancedPdf -Path $Path -Gamma $Gamma -PageIndexes $PageIndexes
     try {
+        # 选页已经在重建 PDF 时做掉了，这里整份打即可，不能再传页范围
         [void](Invoke-SumatraPrint -Path $tmp -Printer $Printer -Copies $Copies)
     } finally {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
-    return "加深处理后再静默打印"
+    return '加深处理后再静默打印'
+}
+
+# ============================ 页数统计 / 页码范围 ============================
+
+$script:PageCountCache = @{}
+
+function Get-PdfPageCount([string]$Path) {
+    if (-not (Initialize-WinRt)) { return -1 }
+    $doc = $null
+    try {
+        $file = Await-WinRtOp ([Windows.Storage.StorageFile]::GetFileFromPathAsync($Path)) ([Windows.Storage.StorageFile])
+        $doc = Await-WinRtOp ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument])
+        return [int]$doc.PageCount
+    } catch { return -1 }
+    finally { if ($doc) { try { $doc.Dispose() } catch { } } }
+}
+
+function Get-OfficePageCount([string]$ProgId, [string]$Path) {
+    $app = Get-OfficeApp $ProgId
+    $docs = [Disp]::Get($app, 'Documents')
+    if ($null -eq $docs) { return -1 }
+    $doc = $null
+    try {
+        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true)
+        if ($null -eq $doc) { return -1 }
+        return [int][Disp]::Call($doc, 'ComputeStatistics', 2)   # wdStatisticPages
+    } catch { return -1 }
+    finally { if ($doc) { try { [Disp]::Call($doc, 'Close', 0) | Out-Null } catch { } } }
+}
+
+function Get-FilePageCount([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return -1 }
+    $key = $Path
+    try { $key = $Path + '|' + (Get-Item -LiteralPath $Path).LastWriteTimeUtc.Ticks } catch { }
+    if ($script:PageCountCache.ContainsKey($key)) { return [int]$script:PageCountCache[$key] }
+
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $n = -1
+    if ($ext -eq '.pdf') {
+        $n = Get-PdfPageCount $Path
+    } else {
+        foreach ($prog in $script:OfficeOrder) {
+            if ($prog -eq 'Word.Application' -and -not $script:EngineStatus.word) { continue }
+            if ($prog -like '*KWPS*' -and -not $script:EngineStatus.wps) { continue }
+            $n = Get-OfficePageCount $prog $Path
+            if ($n -gt 0) { break }
+        }
+    }
+    $script:PageCountCache[$key] = $n
+    return $n
+}
+
+function Test-PageSpec([string]$Spec, [int]$MaxPages) {
+    # 返回 '' 表示合法，否则返回中文错误说明
+    if ([string]::IsNullOrWhiteSpace($Spec)) { return '' }
+    foreach ($raw in ($Spec -split ',')) {
+        $p = $raw.Trim()
+        if ($p -eq '') { return '页码范围里有空项（是不是多打了一个逗号？）' }
+        if ($p -match '^(?i)(even|odd|last)$') { continue }
+        if ($p -match '^-\d+$') { continue }
+        if ($p -match '^\d+$') {
+            $n = [int]$p
+            if ($n -lt 1) { return "页码要从 1 开始：$p" }
+            if ($MaxPages -gt 0 -and $n -gt $MaxPages) { return "第 $n 页超出范围（这份文件共 $MaxPages 页）" }
+            continue
+        }
+        if ($p -match '^(\d+)\s*-\s*(\d+)$') {
+            $a = [int]$Matches[1]; $b = [int]$Matches[2]
+            if ($a -lt 1 -or $b -lt 1) { return "页码要从 1 开始：$p" }
+            if ($MaxPages -gt 0 -and ([Math]::Max($a, $b) -gt $MaxPages)) { return "第 $p 页超出范围（这份文件共 $MaxPages 页）" }
+            continue
+        }
+        return "看不懂的页码：「$p」，正确写法像 1-3,5,8"
+    }
+    return ''
+}
+
+# 0 基页索引 -> "1-3,5,8-10" 这种紧凑写法（SumatraPDF 和 Word 都认）
+function ConvertTo-PageSpec([int[]]$Indexes) {
+    if ($null -eq $Indexes -or $Indexes.Count -eq 0) { return '' }
+    $nums = @($Indexes | Sort-Object -Unique)
+    $parts = @()
+    $start = $nums[0]; $prev = $nums[0]
+    for ($i = 1; $i -le $nums.Count; $i++) {
+        $cur = if ($i -lt $nums.Count) { [int]$nums[$i] } else { [int]::MinValue }
+        if ($cur -eq $prev + 1) { $prev = $cur; continue }
+        $a = $start + 1; $b = $prev + 1
+        if ($a -eq $b) { $parts += "$a" } else { $parts += "$a-$b" }
+        $start = $cur; $prev = $cur
+    }
+    return ($parts -join ',')
+}
+
+# "1-3,5" / even / odd / last / -1 -> 0 基页索引数组（去重升序）；空串 = 全部页
+function ConvertTo-PageIndexList([string]$Spec, [int]$PageCount) {
+    if ($PageCount -le 0) { return @() }
+    if ([string]::IsNullOrWhiteSpace($Spec)) { return @(0..($PageCount - 1)) }
+    $set = New-Object 'System.Collections.Generic.SortedSet[int]'
+    foreach ($raw in ($Spec -split ',')) {
+        $p = $raw.Trim()
+        if ($p -eq '') { continue }
+        if ($p -match '^(?i)odd$') { for ($i = 1; $i -le $PageCount; $i += 2) { [void]$set.Add($i - 1) }; continue }
+        if ($p -match '^(?i)even$') { for ($i = 2; $i -le $PageCount; $i += 2) { [void]$set.Add($i - 1) }; continue }
+        if ($p -match '^(?i)last$') { [void]$set.Add($PageCount - 1); continue }
+        if ($p -match '^-\d+$') {
+            $n = [int]$p.Substring(1)
+            if ($n -ge 1 -and $n -le $PageCount) { [void]$set.Add($PageCount - $n) }
+            continue
+        }
+        if ($p -match '^\d+$') {
+            $n = [int]$p
+            if ($n -ge 1 -and $n -le $PageCount) { [void]$set.Add($n - 1) }
+            continue
+        }
+        if ($p -match '^(\d+)\s*-\s*(\d+)$') {
+            $a = [int]$Matches[1]; $b = [int]$Matches[2]
+            $lo = [Math]::Min($a, $b); $hi = [Math]::Max($a, $b)
+            for ($i = $lo; $i -le $hi; $i++) {
+                if ($i -ge 1 -and $i -le $PageCount) { [void]$set.Add($i - 1) }
+            }
+            continue
+        }
+    }
+    return @($set)
 }
 
 function Invoke-PrintFile {
-    param([string]$Path, [string]$Printer, [int]$Copies = 1, [bool]$DryRun = $false, [string]$Enhance = 'auto')
-
+    param(
+        [string]$Path,
+        [string]$Printer,
+        [int]$Copies = 1,
+        [bool]$DryRun = $false,
+        [string]$Enhance = 'auto',
+        [string]$Pages = '',
+        [bool]$ClampPages = $false
+    )
     $result = [ordered]@{
         path = $Path; ok = $false; method = ''; detail = ''
         time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -871,6 +1019,34 @@ function Invoke-PrintFile {
     if ($SupportedExt -notcontains $ext) { $result.detail = "不支持的格式 $ext"; return $result }
     if ($Copies -lt 1) { $Copies = 1 }
     if ($Printer -and -not (Test-PrinterExists $Printer)) { $result.detail = "找不到打印机「$Printer」"; return $result }
+
+    # 页范围：先按"已知页数"校验一遍，防止用户手输 999 页把打印任务搞乱
+    $Pages = ([string]$Pages).Trim()
+    $pageCount = -1
+    if ($Pages -ne '') {
+        $pageCount = Get-FilePageCount $Path
+        if ($ClampPages -and $pageCount -gt 0) {
+            # 批量套用页码时走这条：某个文件页数更少，越界的那几页直接丢掉，
+            # 而不是让整份文件失败（比如「都只打 1-3 页」遇到一份只有 2 页的简历）
+            $idx = ConvertTo-PageIndexList $Pages $pageCount
+            if ($idx.Count -eq 0) {
+                $result.detail = "第 $Pages 页在这份文件里一页都不存在（它只有 $pageCount 页）"
+                return $result
+            }
+            $Pages = ConvertTo-PageSpec $idx
+        } else {
+            $bad = Test-PageSpec $Pages $pageCount
+            if ($bad -ne '') { $result.detail = $bad; return $result }
+            # 规范化：把 "5,1-3" 这类整理成 SumatraPDF/Word 都认的紧凑写法
+            if ($pageCount -gt 0) {
+                $idx = ConvertTo-PageIndexList $Pages $pageCount
+                if ($idx.Count -eq 0) { $result.detail = '选中的页码在这份文件里一页都不存在'; return $result }
+                $Pages = ConvertTo-PageSpec $idx
+            }
+        }
+    }
+    $result['pages'] = $Pages
+    $result['pageCount'] = $pageCount
 
     $usable = @()
     foreach ($prog in $script:OfficeOrder) {
@@ -919,7 +1095,8 @@ function Invoke-PrintFile {
         $result.ok = $true
         if ($plan[0] -like 'enh:*') { $result.method = '加深打印' }
         else { $result.method = $methodName[$plan[0]] }
-        $result.detail = "试运行（未真正打印，目标：$(if ($Printer) { $Printer } else { '默认打印机' })）"
+        $scope = if ($Pages -eq '') { '全部页' } else { "第 $Pages 页" }
+        $result.detail = "试运行（未真正打印，$scope，目标：$(if ($Printer) { $Printer } else { '默认打印机' })）"
         return $result
     }
 
@@ -927,18 +1104,21 @@ function Invoke-PrintFile {
     foreach ($step in $plan) {
         try {
             if ($step -eq 'sumatra') {
-                $result.detail = Invoke-SumatraPrint -Path $Path -Printer $Printer -Copies $Copies
+                $result.detail = Invoke-SumatraPrint -Path $Path -Printer $Printer -Copies $Copies -Pages $Pages
                 $result.method = 'SumatraPDF'
             }
             elseif ($step -like 'enh:*') {
                 $g = [double]::Parse($step.Substring(4), [System.Globalization.CultureInfo]::InvariantCulture)
-                $result.detail = Invoke-PdfEnhancedPrint -Path $Path -Printer $Printer -Copies $Copies -Gamma $g
+                # 加深通道要自己重建 PDF，所以把"选哪几页"换算成 0 基索引传进去
+                $idx = $null
+                if ($Pages -ne '' -and $pageCount -gt 0) { $idx = ConvertTo-PageIndexList $Pages $pageCount }
+                $result.detail = Invoke-PdfEnhancedPrint -Path $Path -Printer $Printer -Copies $Copies -Gamma $g -PageIndexes $idx
                 $result.method = '加深打印'
             }
             elseif ($step -like 'office:*') {
                 $prog = $step.Substring(7)
                 $label = if ($prog -like '*KWPS*') { 'WPS' } else { 'Word' }
-                $result.detail = Invoke-OfficePrint -ProgId $prog -Path $Path -Printer $Printer -Copies $Copies
+                $result.detail = Invoke-OfficePrint -ProgId $prog -Path $Path -Printer $Printer -Copies $Copies -Pages $Pages
                 $result.method = $label
                 $script:OfficeOrder = @($prog) + @($script:OfficeOrder | Where-Object { $_ -ne $prog })
             }
@@ -946,7 +1126,8 @@ function Invoke-PrintFile {
                 $prog = $step.Substring(8)
                 $tmpPdf = Convert-OfficeToPdf -ProgId $prog -Path $Path
                 try {
-                    $result.detail = '转成 PDF 后 ' + (Invoke-SumatraPrint -Path $tmpPdf -Printer $Printer -Copies $Copies)
+                    # 转出来的 PDF 页序与原文档一致，页范围可以直接沿用
+                    $result.detail = '转成 PDF 后 ' + (Invoke-SumatraPrint -Path $tmpPdf -Printer $Printer -Copies $Copies -Pages $Pages)
                     $result.method = '转PDF后静默打印'
                 } finally { Remove-Item $tmpPdf -Force -ErrorAction SilentlyContinue }
             }
@@ -1274,6 +1455,23 @@ function Handle-Api($client, $req) {
         return
     }
 
+    if ($p -eq '/api/pagecount') {
+        $b = Get-BodyJson $req
+        $path = [string](Get-Prop $b 'path' '')
+        if ([string]::IsNullOrWhiteSpace($path) -or -not $script:KnownFiles.ContainsKey($path)) {
+            Send-Json $client ([ordered]@{ ok = $false; count = -1; detail = '这个文件不在本次扫描结果里' })
+            return
+        }
+        $n = Get-FilePageCount $path
+        $result = [ordered]@{
+            ok = ($n -gt 0)
+            count = $n
+            detail = if ($n -gt 0) { '' } else { '拿不到页数（可能是加密/损坏的文件，或本机缺少对应的阅读引擎）' }
+        }
+        Send-Json $client $result
+        return
+    }
+
     if ($p -eq '/api/scan') {
         $b = Get-BodyJson $req
         $folder = [string](Get-Prop $b 'folder' '')
@@ -1294,12 +1492,14 @@ function Handle-Api($client, $req) {
         $copies = [int](Get-Prop $b 'copies' 1)
         $dry = [bool](Get-Prop $b 'dryRun' $false)
         $enh = [string](Get-Prop $b 'enhance' 'auto')
+        $pages = [string](Get-Prop $b 'pages' '')
+        $clamp = [bool](Get-Prop $b 'pagesClamp' $false)
         if ([string]::IsNullOrWhiteSpace($enh)) { $enh = 'auto' }
         $script:Config.printer = $printer
         $script:Config.copies = $copies
         $script:Config.enhance = $enh
         Save-Config
-        $r = Invoke-PrintFile -Path $path -Printer $printer -Copies $copies -DryRun $dry -Enhance $enh
+        $r = Invoke-PrintFile -Path $path -Printer $printer -Copies $copies -DryRun $dry -Enhance $enh -Pages $pages -ClampPages $clamp
         if ($r.ok -and -not $dry) { Save-Printed }
         Send-Json $client $r
         return

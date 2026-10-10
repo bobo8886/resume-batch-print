@@ -76,6 +76,7 @@
             <button class="seg" data-sel="pdf">仅 PDF</button>
             <button class="seg" data-sel="word">仅 Word</button>
           </div>
+          <button id="btnClearPages" class="btn ghost small" hidden>清除所有选页</button>
           <label class="switch mini">
             <input id="onlyUnprinted" type="checkbox">
             <span class="track"><span class="knob"></span></span>
@@ -92,6 +93,7 @@
                 <th class="c-ext">类型</th>
                 <th class="c-size">大小</th>
                 <th class="c-time">修改时间</th>
+                <th class="c-pages">页数 / 选页</th>
                 <th class="c-done">状态</th>
                 <th class="c-act"></th>
               </tr>
@@ -156,6 +158,7 @@
         <div class="summary" id="summary">
           <div class="sum-row"><span>已勾选</span><b id="sumCount">0 份</b></div>
           <div class="sum-row"><span>其中</span><b id="sumMix">—</b></div>
+          <div class="sum-row" id="sumPages" hidden><span>页码</span><b></b></div>
         </div>
 
         <button id="btnPrint" class="btn print">🖨️ 一键打印</button>
@@ -215,6 +218,43 @@
     <div class="modal-foot">
       <button id="pkCancel" class="btn ghost">取消</button>
       <button id="pkOk" class="btn primary">就用这个文件夹</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 选页 ================= -->
+<div id="pagePicker" class="overlay" hidden>
+  <div class="modal pp">
+    <h2>选择要打印的页</h2>
+    <div class="pp-head">
+      <span class="pp-file" id="ppFile"></span>
+      <span class="pp-count" id="ppCount"></span>
+    </div>
+
+    <div class="pp-row">
+      <label class="lbl">页码范围</label>
+      <input id="ppSpec" type="text" spellcheck="false" placeholder="例如 1-3,5,8　（留空 = 全部页）">
+    </div>
+    <div class="pp-row quick">
+      <button class="btn ghost small" id="ppAll">全部页</button>
+      <button class="btn ghost small" id="ppFirst">只看第 1 页</button>
+      <button class="btn ghost small" id="ppOdd">奇数页</button>
+      <button class="btn ghost small" id="ppEven">偶数页</button>
+      <button class="btn ghost small" id="ppNone">全不选</button>
+    </div>
+
+    <div id="ppGrid" class="pp-grid"></div>
+    <p id="ppSum" class="pp-sum"></p>
+    <p id="ppErr" class="pp-err"></p>
+
+    <div class="modal-foot">
+      <label class="switch mini pp-apply" id="ppApplyWrap">
+        <input id="ppApplyAll" type="checkbox">
+        <span class="track"><span class="knob"></span></span>
+        <span class="switch-txt">套用到其它已勾选的简历</span>
+      </label>
+      <button id="ppCancel" class="btn ghost">取消</button>
+      <button id="ppOk" class="btn primary">确定</button>
     </div>
   </div>
 </div>

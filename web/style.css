@@ -213,8 +213,16 @@ tbody tr.sel{background:#f4f8ff}
 tbody tr.sel:hover{background:#eef4ff}
 tbody tr.done .fname{color:var(--muted)}
 .c-check{width:38px}.c-idx{width:48px}.c-ext{width:78px}.c-size{width:92px}
-.c-time{width:156px}.c-done{width:86px}.c-act{width:82px}
+.c-time{width:156px}.c-pages{width:116px}.c-done{width:78px}.c-act{width:152px}
 td.c-time{white-space:nowrap;color:var(--muted)}
+td.c-pages{white-space:nowrap}
+.pageset{
+  display:inline-block;padding:2px 8px;border-radius:6px;font-size:11.5px;font-weight:600;
+  background:#eef4ff;color:var(--brand);border:1px solid #d6e4ff;
+  max-width:108px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;
+}
+.pagesall{color:var(--muted-2);font-size:12.5px}
+.act-pages{padding:5px 9px;font-size:12px;border-radius:7px}
 .idx{color:var(--muted-2);font-variant-numeric:tabular-nums}
 .fname{word-break:break-all;font-weight:500}
 tbody input[type=checkbox],thead input[type=checkbox]{
@@ -327,6 +335,33 @@ tbody input[type=checkbox],thead input[type=checkbox]{
 }
 @keyframes toastIn{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
 .toast.err{background:#b3231b}
+
+/* =====================  选页弹层  ===================== */
+.modal.pp{width:min(760px,100%)}
+.pp-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.pp-file{font-size:13.5px;font-weight:600;word-break:break-all}
+.pp-count{font-size:12.5px;color:var(--muted-2)}
+.pp-row{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+.pp-row .lbl{margin:0;flex:none}
+.pp-row input{flex:1;min-width:160px;font-family:Consolas,"Cascadia Mono",monospace}
+.pp-row.quick{flex-wrap:wrap;gap:7px}
+.pp-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:7px;
+  max-height:min(34vh,300px);overflow:auto;padding:12px;margin-top:6px;
+  border:1px solid var(--line);border-radius:11px;background:#fcfdff;
+}
+.pp-pg{
+  padding:9px 0;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;
+  font-size:13px;color:var(--muted);transition:.12s;font-variant-numeric:tabular-nums;
+}
+.pp-pg:hover{border-color:#bcd3ff;background:#f4f8ff}
+.pp-pg.on{
+  background:linear-gradient(180deg,#3b82f6,#2563eb);border-color:#2563eb;color:#fff;font-weight:600;
+  box-shadow:0 4px 10px -6px rgba(37,99,235,.9);
+}
+.pp-sum{margin-top:10px;font-size:12.5px;color:var(--muted)}
+.pp-err{margin-top:6px;font-size:12.5px;color:var(--err);min-height:18px}
+.pp-apply{margin-right:auto}
 
 /* =====================  响应式  ===================== */
 @media (max-width:1080px){

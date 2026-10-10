@@ -11,11 +11,17 @@
     files: [],
     selected: {},
     result: {},
+    pages: {},          // path -> 页码范围字符串（'' = 全部页）
+    pagesAuto: {},      // path -> true 表示这页范围是"批量套用"来的（越界页可自动裁掉）
+    pageCounts: {},     // path -> 页数（-1 = 拿不到）
     printing: false,
     stopFlag: false,
     filter: '',
     onlyUnprinted: false,
     pkPath: '',
+    ppPath: '',         // 选页弹层当前针对的文件
+    ppSet: {},          // 弹层里正在编辑的页集合（1 基）
+    ppCount: 0,
     tested: false
   };
 
@@ -65,6 +71,59 @@
     return null;
   }
   function isWordExt(e) { return e === '.doc' || e === '.docx' || e === '.rtf' || e === '.odt' || e === '.wps' || e === '.txt'; }
+
+  /* ---------------- 选页：页码范围解析 / 生成 ---------------- */
+  /* 规则与服务端 Test-PageSpec / ConvertTo-PageIndexList 保持一致：
+     n | n-m | even | odd | last | -n，逗号分隔 */
+
+  function isPageable(e) { return e === '.pdf' || isWordExt(e); }
+
+  function parsePages(spec, count) {
+    var set = {};
+    if (!count || count < 1) { return set; }
+    if (!spec || !String(spec).trim()) {
+      for (var k = 1; k <= count; k++) { set[k] = true; }
+      return set;
+    }
+    String(spec).split(',').forEach(function (raw) {
+      var p = raw.trim();
+      if (!p) { return; }
+      var m;
+      if (/^odd$/i.test(p)) { for (var i = 1; i <= count; i += 2) { set[i] = true; } return; }
+      if (/^even$/i.test(p)) { for (var j = 2; j <= count; j += 2) { set[j] = true; } return; }
+      if (/^last$/i.test(p)) { set[count] = true; return; }
+      if ((m = /^-(\d+)$/.exec(p))) { var a = +m[1]; if (a >= 1 && a <= count) { set[count - a + 1] = true; } return; }
+      if ((m = /^(\d+)$/.exec(p))) { var b = +m[1]; if (b >= 1 && b <= count) { set[b] = true; } return; }
+      if ((m = /^(\d+)\s*-\s*(\d+)$/.exec(p))) {
+        var lo = Math.min(+m[1], +m[2]), hi = Math.max(+m[1], +m[2]);
+        for (var t = lo; t <= hi; t++) { if (t >= 1 && t <= count) { set[t] = true; } }
+        return;
+      }
+    });
+    return set;
+  }
+
+  function pageNums(set) {
+    return Object.keys(set).map(Number).filter(function (n) { return set[n]; })
+      .sort(function (a, b) { return a - b; });
+  }
+
+  function formatPages(set) {
+    var nums = pageNums(set);
+    if (!nums.length) { return ''; }
+    var parts = [], start = nums[0], prev = nums[0];
+    for (var i = 1; i <= nums.length; i++) {
+      var cur = (i < nums.length) ? nums[i] : -999999;
+      if (cur === prev + 1) { prev = cur; continue; }
+      parts.push(start === prev ? String(start) : (start + '-' + prev));
+      start = cur; prev = cur;
+    }
+    return parts.join(',');
+  }
+
+  function defaultPagesText(count) {
+    return '共 ' + count + ' 页';
+  }
 
   /* ---------------- 引擎状态 ---------------- */
 
@@ -240,6 +299,9 @@
         state.files = asArray(d.files);
         state.selected = {};
         state.result = {};
+        state.pages = {};
+        state.pagesAuto = {};
+        state.pageCounts = {};
         state.files.forEach(function (f) { state.selected[f.path] = true; });
         $('filesCard').hidden = false;
         $('placeholder').hidden = true;
@@ -275,6 +337,23 @@
         : st === 'dry' ? '<span class="badge warn">已试运行</span>'
           : st === 'err' ? '<span class="badge warn">失败</span>'
             : (f.printed ? '<span class="badge ok">打过</span>' : '');
+      // 页数 / 选页列
+      var spec = state.pages[f.path] || '';
+      var cnt = state.pageCounts[f.path];
+      var pageHtml;
+      if (!isPageable(f.ext)) {
+        pageHtml = '<span class="pagesall">—</span>';
+      } else if (spec) {
+        pageHtml = '<span class="pageset" title="只打这些页：' + esc(spec) + '">' + esc(spec) + '</span>';
+      } else if (cnt && cnt > 0) {
+        pageHtml = '<span class="pagesall">' + cnt + ' 页</span>';
+      } else {
+        pageHtml = '<span class="pagesall">—</span>';
+      }
+      var actHtml = isPageable(f.ext)
+        ? ('<button class="btn act-pages">选页</button><button class="btn act-one">只打这个</button>')
+        : '<button class="btn act-one">只打这个</button>';
+
       html += '<tr class="' + cls + '" data-path="' + esc(f.path) + '">'
         + '<td class="c-check"><input type="checkbox" ' + (sel ? 'checked' : '') + '></td>'
         + '<td class="c-idx idx">' + (i + 1) + '</td>'
@@ -282,8 +361,9 @@
         + '<td class="c-ext"><span class="' + badgeClass(f.ext) + '">' + extLabel(f.ext) + '</span></td>'
         + '<td class="c-size">' + fmtSize(f.size) + '</td>'
         + '<td class="c-time">' + esc(f.mtime) + '</td>'
+        + '<td class="c-pages">' + pageHtml + '</td>'
         + '<td class="c-done">' + stHtml + '</td>'
-        + '<td class="c-act"><button class="btn act-one">只打这个</button></td>'
+        + '<td class="c-act">' + actHtml + '</td>'
         + '</tr>';
     });
     $('tbody').innerHTML = html;
@@ -292,6 +372,11 @@
     var nSel = state.files.filter(function (f) { return state.selected[f.path]; }).length;
     $('count').textContent = '已选 ' + nSel + ' / ' + state.files.length;
     $('checkAll').checked = list.length > 0 && list.every(function (f) { return state.selected[f.path]; });
+
+    // 有选页设置时才显示「清除所有选页」
+    var anyPages = state.files.some(function (f) { return !!state.pages[f.path]; });
+    $('btnClearPages').hidden = !anyPages;
+
     updateSummary();
   }
 
@@ -300,12 +385,20 @@
     var n = picked.length;
     var pdf = picked.filter(function (f) { return f.ext === '.pdf'; }).length;
     var word = picked.filter(function (f) { return isWordExt(f.ext); }).length;
+    var withPages = picked.filter(function (f) { return !!state.pages[f.path]; }).length;
 
     $('sumCount').textContent = n + ' 份';
     var mix = [];
     if (pdf) mix.push('PDF ' + pdf);
     if (word) mix.push('Word ' + word);
     $('sumMix').textContent = mix.length ? mix.join('　') : '—';
+
+    var pgRow = $('sumPages');
+    if (pgRow) {
+      var pgB = pgRow.querySelector('b');
+      if (withPages) { if (pgB) pgB.textContent = withPages + ' 份'; pgRow.hidden = false; }
+      else { pgRow.hidden = true; }
+    }
 
     var copies = Math.max(1, parseInt($('copies').value, 10) || 1);
     $('btnPrint').textContent = copies > 1
@@ -387,6 +480,148 @@
     box.innerHTML = html;
   }
 
+  /* ---------------- 选页弹层 ---------------- */
+
+  function fileByPath(p) {
+    for (var i = 0; i < state.files.length; i++) { if (state.files[i].path === p) return state.files[i]; }
+    return null;
+  }
+
+  function openPagePicker(path) {
+    var f = fileByPath(path);
+    if (!f) return;
+    state.ppPath = path;
+    $('ppFile').textContent = f.name;
+    $('ppCount').textContent = '正在读取页数…';
+    $('ppGrid').innerHTML = '<div class="pk-empty">读取中…</div>';
+    $('ppSpec').value = state.pages[path] || '';
+    $('ppSpec').disabled = true;
+    $('ppErr').textContent = '';
+    $('ppSum').textContent = '';
+    $('ppApplyAll').checked = false;
+    $('pagePicker').hidden = false;
+    ['ppAll', 'ppFirst', 'ppOdd', 'ppEven', 'ppNone', 'ppOk'].forEach(function (id) { $(id).disabled = true; });
+
+    var known = state.pageCounts[path];
+    var done = function (count) {
+      state.pageCounts[path] = count;
+      state.ppCount = count;
+      $('ppSpec').disabled = false;
+      ['ppAll', 'ppFirst', 'ppOdd', 'ppEven', 'ppNone', 'ppOk'].forEach(function (id) { $(id).disabled = false; });
+      if (count > 0) {
+        $('ppCount').textContent = defaultPagesText(count) + '　·　点下面的页码可以加选 / 取消';
+        state.ppSet = parsePages($('ppSpec').value, count);
+        renderPageGrid();
+      } else {
+        $('ppCount').textContent = '拿不到页数';
+        state.ppSet = {};
+        state.ppCount = 0;
+        $('ppGrid').innerHTML = '<div class="pk-empty">这个文件读不出页数（可能是加密文件，或本机缺少对应的阅读引擎）。<br>你仍然可以直接在下面填页码范围，打印时服务端会再校验一次。</div>';
+        $('ppErr').textContent = '提示：填错页码会在打印日志里明确报出来。';
+      }
+      syncFromSet();
+    };
+
+    if (known !== undefined) { done(known); return; }
+    api('/api/pagecount', { path: path }).then(function (d) {
+      done(d && d.ok ? d.count : -1);
+      if (!d || !d.ok) { $('ppErr').textContent = (d && d.detail) || '读取页数失败'; }
+    }).catch(function () { done(-1); });
+  }
+
+  function renderPageGrid() {
+    var n = state.ppCount;
+    if (n <= 0) return;
+    var html = '';
+    for (var i = 1; i <= n; i++) {
+      html += '<button class="pp-pg' + (state.ppSet[i] ? ' on' : '') + '" data-pg="' + i + '">' + i + '</button>';
+    }
+    $('ppGrid').innerHTML = html;
+  }
+
+  // 文本框 -> 页集合（不回头改文本框，避免死循环）
+  function syncFromSet() {
+    var n = state.ppCount;
+    if (n > 0) {
+      var spec = $('ppSpec').value;
+      state.ppSet = parsePages(spec, n);
+      var btns = $('ppGrid').querySelectorAll('.pp-pg');
+      Array.prototype.forEach.call(btns, function (b) {
+        var p = +b.getAttribute('data-pg');
+        if (state.ppSet[p]) { b.classList.add('on'); } else { b.classList.remove('on'); }
+      });
+    }
+    updatePageSum();
+  }
+
+  // 页集合 -> 文本框
+  function syncSpecFromSet() {
+    $('ppSpec').value = formatPages(state.ppSet);
+    updatePageSum();
+  }
+
+  function updatePageSum() {
+    var n = state.ppCount;
+    var picked = pageNums(state.ppSet);
+    if (n <= 0) { $('ppSum').textContent = ''; return; }
+    if (picked.length === n) { $('ppSum').textContent = '已选全部 ' + n + ' 页'; return; }
+    if (!picked.length) { $('ppSum').textContent = '一页都没选'; return; }
+    var text = picked.join(', ');
+    if (text.length > 90) { text = text.slice(0, 90) + ' …'; }
+    $('ppSum').textContent = '已选 ' + picked.length + ' / ' + n + ' 页：' + text;
+  }
+
+  function setPagePick(pred) {
+    var n = state.ppCount;
+    if (n <= 0) { return; }
+    state.ppSet = {};
+    for (var i = 1; i <= n; i++) { if (pred(i)) { state.ppSet[i] = true; } }
+    renderPageGrid();
+    syncSpecFromSet();
+  }
+
+  function commitPagePicker() {
+    var path = state.ppPath;
+    var n = state.ppCount;
+    var spec;
+
+    if (n > 0) {
+      var picked = pageNums(state.ppSet);
+      if (picked.length === 0) { $('ppErr').textContent = '至少要选一页'; return; }
+      if (picked.length === n) {
+        spec = '';                       // 全选就等于没限制
+      } else {
+        spec = formatPages(state.ppSet);
+      }
+    } else {
+      spec = $('ppSpec').value.trim();   // 拿不到页数时按用户手填的原样交给服务端
+    }
+
+    state.pages[path] = spec;
+    delete state.pagesAuto[path];
+
+    var applied = 0, skipped = 0;
+    if ($('ppApplyAll').checked && spec) {
+      state.files.forEach(function (f) {
+        if (f.path === path || !state.selected[f.path] || !isPageable(f.ext)) return;
+        state.pages[f.path] = spec;
+        state.pagesAuto[f.path] = true;   // 标记为"批量套用"，打印时允许自动裁剪越界页
+        applied++;
+      });
+    }
+
+    $('pagePicker').hidden = true;
+    render();
+    if (applied) {
+      toast('已设置 ' + path.split('\\').pop() + '，并套用到另外 ' + applied + ' 份简历');
+    } else if (spec) {
+      toast('已设置只打印第 ' + spec + ' 页');
+    } else {
+      toast('已恢复为打印全部页');
+    }
+    if (skipped) { /* 目前不会走到 */ }
+  }
+
   /* ---------------- 打印 ---------------- */
 
   function logLine(text, cls) {
@@ -431,6 +666,8 @@
     $('bar').style.width = '0%';
     logLine('目标打印机：' + (printer || '系统默认打印机'), 'l-info');
     logLine('每份份数：' + copies + '　　共 ' + total + ' 份简历', 'l-info');
+    var pageCount = paths.filter(function (p) { return !!state.pages[p]; }).length;
+    if (pageCount) { logLine('其中 ' + pageCount + ' 份指定了页码（只打选中的页）', 'l-info'); }
     logLine('────────────────────────────', 'l-info');
 
     var i = 0, okCount = 0, failCount = 0, t0 = Date.now();
@@ -443,7 +680,16 @@
       $('ovStat').textContent = '正在处理 ' + (i + 1) + ' / ' + total + '：' + name;
       $('bar').style.width = Math.round((i / total) * 100) + '%';
 
-      api('/api/print-one', { path: path, printer: printer, copies: copies, dryRun: dry, enhance: enhance })
+      var spec = state.pages[path] || '';
+      var pay = { path: path, printer: printer, copies: copies, dryRun: dry, enhance: enhance };
+      if (spec) {
+        pay.pages = spec;
+        // 批量套用来的页码：文件页数更少时自动裁掉越界页，不让整份失败
+        if (state.pagesAuto[path]) { pay.pagesClamp = true; }
+      }
+      if (spec) { logLine('  ' + name + '　（第 ' + spec + ' 页）', 'l-info'); }
+
+      api('/api/print-one', pay)
         .then(function (r) {
           if (r.ok) {
             okCount++;
@@ -537,8 +783,7 @@
   };
 
   // ---- 文件夹浏览器 ----
-  $('pkCancel').onclick = function () { $('picker').hidden = true; };
-  $('pkOk').onclick = function () {
+  $('pkCancel').onclick = function () { $('picker').hidden = true; };  $('pkOk').onclick = function () {
     var chosen = $('pkPath').value.trim() || state.pkPath;
     if (!chosen) { toast('请先进入一个文件夹', true); return; }
     $('picker').hidden = true;
@@ -561,6 +806,36 @@
     if (c) pkLoad(c.getAttribute('data-crumb'));
   };
   $('picker').onclick = function (e) { if (e.target === this) this.hidden = true; };
+
+  // ---- 选页弹层 ----
+  $('ppSpec').oninput = syncFromSet;
+  $('ppGrid').onclick = function (e) {
+    var b = e.target.closest ? e.target.closest('.pp-pg') : null;
+    if (!b) return;
+    var p = +b.getAttribute('data-pg');
+    if (state.ppSet[p]) { delete state.ppSet[p]; } else { state.ppSet[p] = true; }
+    b.classList.toggle('on');
+    syncSpecFromSet();
+  };
+  $('ppAll').onclick = function () { setPagePick(function () { return true; }); };
+  $('ppNone').onclick = function () { setPagePick(function () { return false; }); };
+  $('ppFirst').onclick = function () { setPagePick(function (i) { return i === 1; }); };
+  $('ppOdd').onclick = function () { setPagePick(function (i) { return i % 2 === 1; }); };
+  $('ppEven').onclick = function () { setPagePick(function (i) { return i % 2 === 0; }); };
+  $('ppCancel').onclick = function () { $('pagePicker').hidden = true; };
+  $('ppOk').onclick = commitPagePicker;
+  $('pagePicker').onclick = function (e) { if (e.target === this) this.hidden = true; };
+  $('ppApplyWrap').onclick = function (e) { if (e.target === this) e.preventDefault(); };
+
+  $('btnClearPages').onclick = function () {
+    var n = Object.keys(state.pages).filter(function (k) { return state.pages[k]; }).length;
+    if (!n) { return; }
+    if (!confirm('清除全部 ' + n + ' 份简历的页码设置，恢复成"打印所有页"？')) return;
+    state.pages = {};
+    state.pagesAuto = {};
+    render();
+    toast('已清除所有页码设置');
+  };
 
   // ---- 主界面 ----
   $('printer').onchange = updatePrinterInfo;
@@ -592,6 +867,7 @@
     if (!tr) return;
     var path = tr.getAttribute('data-path');
     if (e.target.classList.contains('act-one')) { printList([path]); return; }
+    if (e.target.classList.contains('act-pages')) { openPagePicker(path); return; }
     state.selected[path] = !state.selected[path];
     render();
   };
@@ -613,6 +889,7 @@
   $('btnOpenRec').onclick = function () { api('/api/open', {}); };
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
+    if (!$('pagePicker').hidden) { $('pagePicker').hidden = true; return; }
     if (!$('picker').hidden) { $('picker').hidden = true; return; }
     if (!$('overlay').hidden && !state.printing) { $('overlay').hidden = true; }
   });
