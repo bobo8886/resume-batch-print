@@ -58,7 +58,24 @@ function Read-JsonFile([string]$Path) {
 }
 function Write-JsonFile([string]$Path, $Obj) {
     $json = $Obj | ConvertTo-Json -Depth 8
-    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    # 原子写：先写同目录下的临时文件，再用 File.Replace 整体替换。
+    # 以前直接 WriteAllText（先截断后写入），崩在中间会留下一个空/截断的
+    # config.json 或 printed.json，下次启动静默回落默认值。
+    # 注意：不能给 File.Replace 的第三个参数传 $null —— PowerShell 会把它
+    # 转成空字符串，而空串是非法路径，会直接抛"路径的形式不合法"。
+    $tmp = $Path + '.tmp'
+    $bak = $Path + '.bak'
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        if ([System.IO.File]::Exists($Path)) {
+            [System.IO.File]::Replace($tmp, $Path, $bak)
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } finally {
+        Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 function Get-Prop($Obj, [string]$Name, $Default) {
     if ($null -eq $Obj) { return $Default }
@@ -88,9 +105,23 @@ function Add-RecentFolder([string]$Folder) {
 }
 
 $script:Printed = @{}
+# 打印历史的上限。以前没有任何上限：每成功打印一份就加一个键，
+# 然后把整个 map 重写一遍，安装期内文件和内存都无界增长。
+$script:PrintedMax = 5000
 $pr = Read-JsonFile $PrintedFile
 if ($pr) { foreach ($p in $pr.PSObject.Properties) { $script:Printed[$p.Name] = $p.Value } }
-function Save-Printed { Write-JsonFile $PrintedFile $script:Printed }
+function Save-Printed {
+    # 超上限时按值里的时间戳丢掉最旧的，只留最近 $script:PrintedMax 条
+    if ($script:Printed.Count -gt $script:PrintedMax) {
+        $keep = @($script:Printed.GetEnumerator() |
+                  Sort-Object -Property @{ Expression = { [string]$_.Value } } -Descending |
+                  Select-Object -First $script:PrintedMax)
+        $fresh = @{}
+        foreach ($e in $keep) { $fresh[$e.Key] = $e.Value }
+        $script:Printed = $fresh
+    }
+    Write-JsonFile $PrintedFile $script:Printed
+}
 
 # 本次会话里"被扫描列出来过"的文件，只有这些才允许打印
 $script:KnownFiles = @{}
@@ -377,9 +408,20 @@ function Resolve-SumatraEngine([string]$Bundled) {
         try {
             if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
             $target = Join-Path $d 'SumatraPDF.exe'
+            # 复用条件从"字节长度相同"改成"哈希与内置副本相同"。
+            # 长度相等是攻击者可满足的：往一个本机可写的搬迁目录里放一个
+            # 填充到同样长度的伪造引擎，就会被一直复用并在每次打印时执行。
             $need = $true
-            if ((Test-Path $target) -and ((Get-Item $target).Length -eq (Get-Item $Bundled).Length)) { $need = $false }
+            if (Test-Path $target) {
+                try {
+                    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $Bundled -Algorithm SHA256).Hash) { $need = $false }
+                } catch { $need = $true }
+            }
             if ($need) { Copy-Item -LiteralPath $Bundled -Destination $target -Force }
+            # 复制/复用后仍然只有哈希相同才认，否则退回内置路径，不去执行一个来路不明的文件
+            try {
+                if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $Bundled -Algorithm SHA256).Hash) { continue }
+            } catch { continue }
             $s = Join-Path $BinDir 'SumatraPDF-settings.txt'
             if (Test-Path $s) { Copy-Item -LiteralPath $s -Destination (Join-Path $d 'SumatraPDF-settings.txt') -Force }
             if (Test-Path $target) { return $target }
@@ -469,7 +511,14 @@ function Install-PdfEngine {
         Write-EngineSettings $targetDir
 
         $script:SumatraPath = Resolve-SumatraEngine $SumatraBundled
-        if (-not (Test-Path $script:SumatraPath)) { $script:SumatraPath = $final }
+        # 解析出来的路径必须真的就是刚才校验通过的那个文件；
+        # 否则说明搬迁目录里有个不同的二进制，宁可退回 $final，也不去执行它。
+        if (-not (Test-Path $script:SumatraPath)) {
+            $script:SumatraPath = $final
+        } elseif ((Get-FileHash -LiteralPath $script:SumatraPath -Algorithm SHA256).Hash -ne $script:EngineSha256) {
+            Write-EngineSettings $targetDir
+            $script:SumatraPath = $final
+        }
         $script:SumatraRelocated = ($script:SumatraPath -ne $SumatraBundled)
         $script:EngineStatus.sumatra = (Test-Path $script:SumatraPath)
         return $final
@@ -529,8 +578,11 @@ function Invoke-EngineSelfTest {
             if (-not $present) { continue }
             $label = if ($prog -like '*KWPS*') { 'WPS' } else { 'Word' }
             $app = $null
+            $before = Get-OfficeProcessIds
+            $owned = @()
             try {
                 $app = New-Object -ComObject $prog
+                $owned = Get-NewOfficeProcessIds $before
                 $docs = $null
                 for ($i = 0; $i -lt 24 -and $null -eq $docs; $i++) {
                     try { $docs = [Disp]::Get($app, 'Documents') } catch { $docs = $null }
@@ -546,7 +598,10 @@ function Invoke-EngineSelfTest {
             } finally {
                 if ($app) { try { [Disp]::Call($app, 'Quit') | Out-Null } catch { }; try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($app) } catch { } }
                 Start-Sleep -Milliseconds 400
-                Get-Process WINWORD, wps -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                # 只终止本次自检**自己启动**的进程。
+                # 以前这里是 `Get-Process WINWORD, wps | Stop-Process -Force`，
+                # 会把操作者自己打开、还有未保存内容的文档一起强杀掉。
+                Stop-OfficeProcessId $owned
             }
         }
     }
@@ -618,7 +673,8 @@ function Get-PrinterList {
 
 function Get-PrinterPortName([string]$Printer) {
     try {
-        $pk = Get-ItemProperty ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\" + $Printer) -ErrorAction SilentlyContinue
+        # -LiteralPath：打印机名里如果带 [ ] * ? 会被当成通配符模式，必须按字面查
+        $pk = Get-ItemProperty -LiteralPath ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\" + $Printer) -ErrorAction SilentlyContinue
         if ($pk -and $pk.Port) { return [string]$pk.Port }
     } catch { }
     return ''
@@ -626,7 +682,17 @@ function Get-PrinterPortName([string]$Printer) {
 
 function Test-PrinterExists([string]$Name) {
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-    return (Test-Path ("HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\" + $Name))
+    # 精确成员测试，不做通配符路径解析。
+    # 以前是 Test-Path 拼注册表路径，而 Test-Path 把 -Path 当**通配符模式**，
+    # 于是 "*" / "HP*" / "[a-z]*" 这类值也能"通过校验"，随后被原样拼进
+    # Start-Process 的参数串里（也让配置里存下一个根本不是打印机的名字）。
+    # 现在只接受与已安装打印机键名**完全相等**的值。
+    if ($Name -match '["*?\[\]]') { return $false }
+    try {
+        $keys = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -ErrorAction SilentlyContinue |
+                  Select-Object -ExpandProperty PSChildName)
+        return ($keys -ccontains $Name)
+    } catch { return $false }
 }
 
 function Get-SuggestedPrinter($pl) {
@@ -646,6 +712,29 @@ function Get-SuggestedPrinter($pl) {
 $script:OfficeApp = $null
 $script:OfficeProgId = ''
 $script:OfficeLastUse = [datetime]::MinValue
+# 只记录**本工具自己启动**的 Office 进程 id。绝不做"按映像名无差别强杀"。
+$script:OfficeOwnedPids = @()
+
+function Get-OfficeProcessIds {
+    return @(Get-Process -Name WINWORD, wps -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+}
+
+# 创建 COM 实例前后各取一次快照，差集才是我们"新开出来"的进程。
+# 如果 New-Object 附着到了操作者已经打开的实例上，差集就是空的 —— 那就一个都不杀。
+function Get-NewOfficeProcessIds([int[]]$Before) {
+    if ($null -eq $Before) { $Before = @() }
+    return @(Get-OfficeProcessIds | Where-Object { $Before -notcontains $_ })
+}
+
+function Stop-OfficeProcessId([int[]]$Ids) {
+    foreach ($procId in @($Ids)) {
+        if (-not $procId) { continue }
+        try {
+            $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+            if ($p) { $p.Kill(); [void]$p.WaitForExit(5000) }
+        } catch { }
+    }
+}
 
 function Close-OfficeApp {
     if ($script:OfficeApp) {
@@ -654,6 +743,12 @@ function Close-OfficeApp {
         $script:OfficeApp = $null
         $script:OfficeProgId = ''
         [GC]::Collect()
+    }
+    # Quit 可能被"是否保存"的模态框卡住。这时才需要强杀 —— 但**只杀我们自己起的那个 pid**。
+    if ($script:OfficeOwnedPids.Count -gt 0) {
+        Start-Sleep -Milliseconds 300
+        Stop-OfficeProcessId $script:OfficeOwnedPids
+        $script:OfficeOwnedPids = @()
     }
 }
 
@@ -667,10 +762,12 @@ function Get-OfficeApp([string]$ProgId) {
         Close-OfficeApp
     }
     if ($script:OfficeApp) { Close-OfficeApp }
+    $before = Get-OfficeProcessIds
     $app = New-Object -ComObject $ProgId
     $script:OfficeApp = $app
     $script:OfficeProgId = $ProgId
     $script:OfficeLastUse = $now
+    $script:OfficeOwnedPids = Get-NewOfficeProcessIds $before
     return $app
 }
 
@@ -702,17 +799,39 @@ function Invoke-SumatraPrint {
 function Set-OfficePrinter($App, [string]$Printer) {
     if ([string]::IsNullOrWhiteSpace($Printer)) { return }
     $port = Get-PrinterPortName $Printer
+    $lastErr = ''
     foreach ($cand in @("$Printer on $port", $Printer)) {
         if ([string]::IsNullOrWhiteSpace($cand) -or $cand -eq ' on ') { continue }
-        try { [Disp]::Set($App, 'ActivePrinter', $cand) } catch { continue }
-        # 设置本身没报错就算成功；读回来只是复核，读不到不算失败
-        try {
-            $back = [string][Disp]::Get($App, 'ActivePrinter')
-            if ($back -and $back -ne $Printer -and $back -notlike ($Printer + '*')) { continue }
-        } catch { }
+        try { [Disp]::Set($App, 'ActivePrinter', $cand) } catch { $lastErr = $_.Exception.Message; continue }
+        # 回读**必须**成功且匹配才算设置成功。
+        # 以前这里是"读不到不算失败"，于是一个根本没生效的打印机会被当成成功，
+        # 任务就落到别的地方去了 —— 相当于把校验写成了装饰。
+        $back = ''
+        try { $back = [string][Disp]::Get($App, 'ActivePrinter') } catch { continue }
+        if ([string]::IsNullOrWhiteSpace($back)) { continue }
+        if ($back -ne $Printer -and $back -notlike ($Printer + '*')) { continue }
         return
     }
-    throw "无法把打印目标切到「$Printer」"
+    if ($lastErr) { throw "无法把打印目标切到「$Printer」（$lastErr）" }
+    throw "无法把打印目标切到「$Printer」（回读校验未通过，可能这台打印机不存在或不可用）"
+}
+
+# 打开不可信文档之前，先把 Office 的"自动化安全"收紧。
+# 以前只传了 ReadOnly —— 那只挡住"回写到原文件"，对文档里携带的宏、
+# 外部链接、打开时的字段更新**一概不设防**，而工具本身也不弹任何提示。
+# 这里显式：关闭全部宏（msoAutomationSecurityForceDisable = 3）、关闭链接更新、
+# 关闭转换确认与警告弹窗。WPS 上没有这些属性时逐项 try/catch 忽略，不影响正常打印。
+function Set-OfficeSafety($App) {
+    if ($null -eq $App) { return }
+    try { [Disp]::Set($App, 'AutomationSecurity', 3) } catch { }
+    try { [Disp]::Set($App, 'DisplayAlerts', 0) } catch { }
+    try {
+        $opts = [Disp]::Get($App, 'Options')
+        if ($opts) {
+            try { [Disp]::Set($opts, 'UpdateLinksAtOpen', $false) } catch { }
+            try { [Disp]::Set($opts, 'ConfirmConversions', $false) } catch { }
+        }
+    } catch { }
 }
 
 function Invoke-OfficePrint {
@@ -722,11 +841,15 @@ function Invoke-OfficePrint {
     $docs = [Disp]::Get($app, 'Documents')
     if ($null -eq $docs) { throw "$label 组件没有就绪" }
 
+    Set-OfficeSafety $app
     Set-OfficePrinter $app $Printer
 
     $doc = $null
     try {
-        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true)
+        # Open(FileName, ConfirmConversions, ReadOnly, AddToRecentFiles)
+        # 第 4 个参数把文档挡在"最近使用的文件"列表之外，避免打印一份简历就往
+        # 操作者的 Word 历史里塞一条记录（简历路径属 PII）。
+        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true, $false)
         if ($null -eq $doc) { throw "$label 打不开这个文件" }
         if (-not [string]::IsNullOrWhiteSpace($Pages)) {
             # PrintOut(Background, Append, Range=4(wdPrintRangeOfPages), OutputFileName,
@@ -750,9 +873,10 @@ function Convert-OfficeToPdf {
     $app = Get-OfficeApp $ProgId
     $docs = [Disp]::Get($app, 'Documents')
     if ($null -eq $docs) { throw '组件没有就绪' }
+    Set-OfficeSafety $app
     $doc = $null
     try {
-        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true)
+        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true, $false)
         if ($null -eq $doc) { throw '打不开这个文件' }
         [Disp]::Call($doc, 'ExportAsFixedFormat', $out, 17) | Out-Null
     } finally {
@@ -892,9 +1016,10 @@ function Get-OfficePageCount([string]$ProgId, [string]$Path) {
     $app = Get-OfficeApp $ProgId
     $docs = [Disp]::Get($app, 'Documents')
     if ($null -eq $docs) { return -1 }
+    Set-OfficeSafety $app
     $doc = $null
     try {
-        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true)
+        $doc = [Disp]::Call($docs, 'Open', $Path, $false, $true, $false)
         if ($null -eq $doc) { return -1 }
         return [int][Disp]::Call($doc, 'ComputeStatistics', 2)   # wdStatisticPages
     } catch { return -1 }
@@ -920,8 +1045,16 @@ function Get-FilePageCount([string]$Path) {
         }
     }
     $script:PageCountCache[$key] = $n
+    # 页数缓存也要封顶：以前只增不减，长年累月翻不同文件夹会一直涨。
+    # 成功与失败的结果都会缓存，所以这里只做容量控制，不丢语义。
+    if ($script:PageCountCache.Count -gt 2000) { $script:PageCountCache = @{} }
     return $n
 }
+
+# 页码的合法上界。真实文档不可能有这么多页，但它能挡住
+# `9999999999` 这种"强转 [int] 直接抛原始转换异常"的输入，
+# 让用户看到友好的范围提示而不是一个 .NET 报错。
+$script:MaxPageNumber = 100000
 
 function Test-PageSpec([string]$Spec, [int]$MaxPages) {
     # 返回 '' 表示合法，否则返回中文错误说明
@@ -930,16 +1063,24 @@ function Test-PageSpec([string]$Spec, [int]$MaxPages) {
         $p = $raw.Trim()
         if ($p -eq '') { return '页码范围里有空项（是不是多打了一个逗号？）' }
         if ($p -match '^(?i)(even|odd|last)$') { continue }
-        if ($p -match '^-\d+$') { continue }
+        if ($p -match '^-\d+$') {
+            if ($p.Length -gt 8) { return "页码数字太大：$p" }
+            continue
+        }
         if ($p -match '^\d+$') {
-            $n = [int]$p
+            if ($p.Length -gt 9) { return "页码数字太大：$p（页码不可能这么大）" }
+            $n = 0
+            if (-not [long]::TryParse($p, [ref]$n)) { return "页码数字太大：$p" }
             if ($n -lt 1) { return "页码要从 1 开始：$p" }
+            if ($n -gt $script:MaxPageNumber) { return "页码太大：$p（最大 $($script:MaxPageNumber)）" }
             if ($MaxPages -gt 0 -and $n -gt $MaxPages) { return "第 $n 页超出范围（这份文件共 $MaxPages 页）" }
             continue
         }
         if ($p -match '^(\d+)\s*-\s*(\d+)$') {
-            $a = [int]$Matches[1]; $b = [int]$Matches[2]
+            $a = 0; $b = 0
+            if (-not [long]::TryParse($Matches[1], [ref]$a) -or -not [long]::TryParse($Matches[2], [ref]$b)) { return "页码数字太大：$p" }
             if ($a -lt 1 -or $b -lt 1) { return "页码要从 1 开始：$p" }
+            if ($a -gt $script:MaxPageNumber -or $b -gt $script:MaxPageNumber) { return "页码太大：$p（最大 $($script:MaxPageNumber)）" }
             if ($MaxPages -gt 0 -and ([Math]::Max($a, $b) -gt $MaxPages)) { return "第 $p 页超出范围（这份文件共 $MaxPages 页）" }
             continue
         }
@@ -1023,9 +1164,11 @@ function Invoke-PrintFile {
     # 页范围：先按"已知页数"校验一遍，防止用户手输 999 页把打印任务搞乱
     $Pages = ([string]$Pages).Trim()
     $pageCount = -1
+    $pageCountKnown = $false
     if ($Pages -ne '') {
         $pageCount = Get-FilePageCount $Path
-        if ($ClampPages -and $pageCount -gt 0) {
+        $pageCountKnown = ($pageCount -gt 0)
+        if ($ClampPages -and $pageCountKnown) {
             # 批量套用页码时走这条：某个文件页数更少，越界的那几页直接丢掉，
             # 而不是让整份文件失败（比如「都只打 1-3 页」遇到一份只有 2 页的简历）
             $idx = ConvertTo-PageIndexList $Pages $pageCount
@@ -1035,18 +1178,27 @@ function Invoke-PrintFile {
             }
             $Pages = ConvertTo-PageSpec $idx
         } else {
+            # $MaxPages = -1 时只做**语法**校验 + 绝对上界校验，不做"是否超出这份文件"的校验。
+            # 这是"页数拿不到"时的显式第三种模式：取值范围无法核对，但输入形态仍然受控。
             $bad = Test-PageSpec $Pages $pageCount
             if ($bad -ne '') { $result.detail = $bad; return $result }
-            # 规范化：把 "5,1-3" 这类整理成 SumatraPDF/Word 都认的紧凑写法
-            if ($pageCount -gt 0) {
+            # 规范化：把 "5,1-3" 这类整理成 SumatraPDF/Word 都认的紧凑写法。
+            # 只有页数已知时才重排/去重；页数未知时原样交给引擎，
+            # 并把这件事明确写进结果里，而不是静默当成功。
+            if ($pageCountKnown) {
                 $idx = ConvertTo-PageIndexList $Pages $pageCount
                 if ($idx.Count -eq 0) { $result.detail = '选中的页码在这份文件里一页都不存在'; return $result }
                 $Pages = ConvertTo-PageSpec $idx
+            } elseif ($ClampPages) {
+                # 批量套用 + 页数未知：无法裁剪，但也不能假装成功
+                $result.detail = "拿不到这份文件的页数，没法按「$Pages」裁剪。请对这份单独用「选页」确认页数后再打。"
+                return $result
             }
         }
     }
     $result['pages'] = $Pages
     $result['pageCount'] = $pageCount
+    $result['pageCountKnown'] = $pageCountKnown
 
     $usable = @()
     foreach ($prog in $script:OfficeOrder) {
@@ -1152,15 +1304,20 @@ function Invoke-PrintFile {
 # ============================ 文件夹浏览 / 扫描 ============================
 
 function Get-DirListing([string]$Path) {
+    # 快捷入口只在"没有指定路径"（也就是停在根）时才返回。
+    # 以前无论调用者查哪个目录都会无条件回带桌面/文档/下载的绝对路径，
+    # 等于把用户配置文件的形态白送给任何人。
     $shortcuts = @()
-    foreach ($pair in @(
-            @('桌面', [Environment]::GetFolderPath('Desktop')),
-            @('我的文档', [Environment]::GetFolderPath('MyDocuments')),
-            @('下载', (Join-Path $env:USERPROFILE 'Downloads')),
-            @('此电脑', '')
-        )) {
-        if ($pair[1] -eq '' -or (Test-Path -LiteralPath $pair[1])) {
-            $shortcuts += [ordered]@{ name = [string]$pair[0]; path = [string]$pair[1] }
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        foreach ($pair in @(
+                @('桌面', [Environment]::GetFolderPath('Desktop')),
+                @('我的文档', [Environment]::GetFolderPath('MyDocuments')),
+                @('下载', (Join-Path $env:USERPROFILE 'Downloads')),
+                @('此电脑', '')
+            )) {
+            if ($pair[1] -eq '' -or (Test-Path -LiteralPath $pair[1])) {
+                $shortcuts += [ordered]@{ name = [string]$pair[0]; path = [string]$pair[1] }
+            }
         }
     }
 
@@ -1212,8 +1369,36 @@ function Get-DirListing([string]$Path) {
 function Invoke-Scan([string]$Folder, [bool]$Recursive) {
     if ([string]::IsNullOrWhiteSpace($Folder)) { throw '请先填写文件夹路径' }
     if (-not (Test-Path -LiteralPath $Folder)) { throw "文件夹不存在：$Folder" }
-    if ($Recursive) { $items = @(Get-ChildItem -LiteralPath $Folder -File -Recurse -ErrorAction SilentlyContinue) }
-    else { $items = @(Get-ChildItem -LiteralPath $Folder -File -ErrorAction SilentlyContinue) }
+
+    # 扫描上限。以前是无限递归：/api/scan 可以对任意存在的目录（含盘根）做无深度、
+    # 无条目数的枚举，整个结果还要序列化进一个响应里 —— 单请求就能把内存和
+    # 唯一那个 worker 占满。现在给出明确的深度与条目上界，超了就截断并告知。
+    $maxDepth = 8
+    $maxEntries = 20000
+    $truncated = $false
+
+    $items = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    try {
+        if ($Recursive) {
+            $stack = New-Object System.Collections.Generic.Stack[object]
+            $stack.Push(@($Folder, 0))
+            while ($stack.Count -gt 0) {
+                $cur = $stack.Pop()
+                $dir = [string]$cur[0]
+                $depth = [int]$cur[1]
+                foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue)) { $items.Add($f) }
+                if ($items.Count -ge $maxEntries) { $truncated = $true; break }
+                if ($depth -ge $maxDepth) { $truncated = $true; continue }
+                foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue)) {
+                    if ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }   # 不跟符号链接/联接走
+                    $stack.Push(@($d.FullName, $depth + 1))
+                }
+            }
+        } else {
+            foreach ($f in @(Get-ChildItem -LiteralPath $Folder -File -Force -ErrorAction SilentlyContinue)) { $items.Add($f) }
+        }
+    } catch { }
+    if ($items.Count -gt $maxEntries) { $items = $items.GetRange(0, $maxEntries); $truncated = $true }
 
     $files = @()
     $other = 0
@@ -1233,7 +1418,13 @@ function Invoke-Scan([string]$Folder, [bool]$Recursive) {
         }
     }
     $files = @($files | Sort-Object { $_.name })
-    return @{ folder = (Resolve-Path -LiteralPath $Folder).Path; files = $files; otherCount = $other }
+    return @{
+        folder = (Resolve-Path -LiteralPath $Folder).Path
+        files = $files
+        otherCount = $other
+        truncated = $truncated
+        truncateNote = $(if ($truncated) { "目录太深或文件太多，只扫描了前 $maxEntries 个条目（最深 $maxDepth 层）。如果确实有更多简历，请缩小文件夹范围。" } else { '' })
+    }
 }
 
 # ============================ HTTP 服务 ============================
@@ -1247,11 +1438,20 @@ function Get-HeaderEndIndex([byte[]]$bytes) {
 
 function Read-HttpRequest($client) {
     $stream = $client.GetStream()
-    $client.ReceiveTimeout = 60000
+
+    # 单次读取超时只约束"一次 Read"，挡不住"每 29 秒滴 1 字节"的连接。
+    # 这个服务只有一个 worker（串行 accept），所以必须再加一个**整个请求的总时限**，
+    # 否则任意一个本机连接就能把界面饿死。这里把单次超时压到 10 秒，
+    # 让总时限最多晚 10 秒被发现，总上限 = 30 + 10 秒。
+    $client.ReceiveTimeout = 10000
+    $reqDeadline = (Get-Date).AddSeconds(30)
+    $timedOut = $false
+
     $ms = New-Object System.IO.MemoryStream
     $buf = New-Object byte[] 8192
     $headerEnd = -1
     while ($headerEnd -lt 0) {
+        if ((Get-Date) -ge $reqDeadline) { $timedOut = $true; break }
         $read = $stream.Read($buf, 0, $buf.Length)
         if ($read -le 0) { break }
         $ms.Write($buf, 0, $read)
@@ -1259,8 +1459,9 @@ function Read-HttpRequest($client) {
         $headerEnd = Get-HeaderEndIndex $all
         if ($all.Length -gt 65536) { break }        # 请求头最大 64KB
     }
+    try { $ms.Dispose() } catch { }
     $all = $ms.ToArray()
-    if ($headerEnd -lt 0) { return $null }
+    if ($timedOut -or $headerEnd -lt 0) { return $null }
 
     $headerText = [System.Text.Encoding]::UTF8.GetString($all, 0, $headerEnd)
     $lines = $headerText -split "`r`n"
@@ -1280,60 +1481,94 @@ function Read-HttpRequest($client) {
         if ($hn -eq 'content-length') { [void][int]::TryParse($hv, [ref]$contentLength) }
     }
 
+    # 先解析出 path/query，再处理请求体。
+    # 之前超限分支在 $path 赋值之前就读它，读到的是未定义变量（靠 Set-StrictMode 未启用来兜底），
+    # 现在把它提到前面，任何分支返回的对象形状都一致。
+    $path = $target
+    $query = ''
+    $qi = $target.IndexOf('?')
+    if ($qi -ge 0) { $path = $target.Substring(0, $qi); $query = $target.Substring($qi + 1) }
+
     # 请求体上限 1MB，防止内存被撑爆
     if ($contentLength -lt 0) { $contentLength = 0 }
     if ($contentLength -gt 1048576) {
-        # 太大：有界地把客户端已经发出来的数据读掉（最多 8MB / 3 秒），
+        # 太大：有界地把客户端已经发出来的数据读掉（最多 8MB，且仍受请求总时限约束），
         # 这样客户端能正常收到我们的 413，而不是被 RST；但绝不会无限读下去。
-        $deadline = (Get-Date).AddSeconds(3)
         $drained = 0
         try {
-            while ($drained -lt $contentLength -and $drained -lt 8388608 -and (Get-Date) -lt $deadline) {
+            while ($drained -lt $contentLength -and $drained -lt 8388608 -and (Get-Date) -lt $reqDeadline) {
                 $n = $stream.Read($buf, 0, $buf.Length)
                 if ($n -le 0) { break }
                 $drained += $n
             }
         } catch { }
-        return @{ tooLarge = $true; method = $method; path = $path; query = ''; body = ''; headers = $headers }
+        return @{ tooLarge = $true; method = $method; path = $path; query = $query; body = ''; headers = $headers }
     }
 
     $bodyStart = $headerEnd + 4
     $bodyMs = New-Object System.IO.MemoryStream
     if ($all.Length -gt $bodyStart) { $bodyMs.Write($all, $bodyStart, $all.Length - $bodyStart) }
     while ($bodyMs.Length -lt $contentLength) {
+        if ((Get-Date) -ge $reqDeadline) { break }
         $read = $stream.Read($buf, 0, $buf.Length)
         if ($read -le 0) { break }
         $bodyMs.Write($buf, 0, $read)
     }
     $body = [System.Text.Encoding]::UTF8.GetString($bodyMs.ToArray())
+    try { $bodyMs.Dispose() } catch { }
 
-    $path = $target
-    $query = ''
-    $qi = $target.IndexOf('?')
-    if ($qi -ge 0) { $path = $target.Substring(0, $qi); $query = $target.Substring($qi + 1) }
-
-    return @{ method = $method; path = $path; query = $query; body = $body; headers = $headers }
+    return @{ tooLarge = $false; method = $method; path = $path; query = $query; body = $body; headers = $headers }
 }
 
 # ---------------- 请求合法性校验（本地服务的安全边界） ----------------
 # 这是一个"能读本地目录、还能指挥打印机"的本地服务，必须挡住：
 #   1) DNS 重绑定：恶意域名解析到 127.0.0.1，浏览器就会带 Host: evil.com 来访问
 #   2) 跨站请求伪造(CSRF)：别的网页偷偷 POST 过来让我们打印 / 翻目录
-# 手段：Host 必须是回环地址；有 Origin 就必须同源；写接口必须 Content-Type: application/json
-#       （HTML 表单发不出 application/json，跨域发它又会先触发预检，而本服务不响应预检）
+#   3) 方法混淆：以前 Content-Type 闸门只写在 "if method = POST" 里，
+#      而分发是按路径的、完全不看方法，于是**不带 Origin 的 GET** 能把三项校验全部绕过
+#      （浏览器对普通跨站 GET 不发送 Origin；目标就是 127.0.0.1，Host 也天然通过），
+#      而 /api/selftest、/api/testprint、/api/reset-printed 等端点**空请求体就有破坏性默认行为**。
+# 手段：
+#   - Host 必须是回环地址（挡 DNS 重绑定）
+#   - 有 Origin 就必须是回环来源
+#   - **所有会改变状态的端点一律要求 POST**，非 POST 直接 405
+#   - POST 必须是 Content-Type: application/json（HTML 表单发不出它，
+#     跨域发它又会先触发预检，而本服务不响应预检、也不发任何 Access-Control-* 头）
+#   - 纵深防御：现代浏览器会带 Sec-Fetch-Site，跨站一律拒绝
+
+# 会改变状态（或有副作用）的端点：一律要求 POST。/api/info 是纯只读的，允许 GET。
+$script:PostOnlyPaths = @(
+    '/api/selftest', '/api/fetch-engine', '/api/list-dir', '/api/pagecount',
+    '/api/scan', '/api/print-one', '/api/end-batch', '/api/restore-printer',
+    '/api/testprint', '/api/open', '/api/reset-printed'
+)
+
 function Test-RequestAllowed($req) {
     $hostHdr = [string]$req.headers['host']
     if (-not [string]::IsNullOrWhiteSpace($hostHdr)) {
         $h = ($hostHdr -split ':')[0].Trim().Trim('[', ']').ToLowerInvariant()
         if ($h -ne '127.0.0.1' -and $h -ne 'localhost' -and $h -ne '::1') { return 'host' }
     }
+
     $origin = [string]$req.headers['origin']
     if (-not [string]::IsNullOrWhiteSpace($origin)) {
         if ($origin -notmatch '^(?i)https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$') { return 'origin' }
     }
-    if ($req.method -eq 'POST') {
-        $ct = [string]$req.headers['content-type']
-        if ($ct -notmatch '^(?i)\s*application/json') { return 'content-type' }
+
+    # 纵深防御：浏览器策略头。非浏览器客户端可以伪造，所以它只是额外一层，不作为唯一控制。
+    $sfs = [string]$req.headers['sec-fetch-site']
+    if ($sfs -eq 'cross-site') { return 'cross-site' }
+
+    $path = [string]$req.path
+    if ($path -like '/api/*') {
+        $needPost = $script:PostOnlyPaths -contains $path
+        if ($needPost) {
+            if ($req.method -ne 'POST') { return 'method' }
+            $ct = [string]$req.headers['content-type']
+            if ($ct -notmatch '^(?i)\s*application/json') { return 'content-type' }
+        } elseif ($req.method -ne 'GET' -and $req.method -ne 'POST') {
+            return 'method'
+        }
     }
     return ''
 }
@@ -1344,7 +1579,7 @@ function Send-Bytes($client, [int]$status, [string]$contentType, [byte[]]$body) 
     $stream = $client.GetStream()
     $reason = $script:ReasonPhrases[$status]
     if (-not $reason) { $reason = 'OK' }
-    $head = "HTTP/1.1 $status $reason`r`nContent-Type: $contentType`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`nConnection: close`r`n`r`n"
+    $head = "HTTP/1.1 $status $reason`r`nContent-Type: $contentType`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`nX-Content-Type-Options: nosniff`r`nConnection: close`r`n`r`n"
     $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
     $stream.Write($headBytes, 0, $headBytes.Length)
     if ($body.Length -gt 0) { $stream.Write($body, 0, $body.Length) }
@@ -1383,9 +1618,24 @@ function Send-Static($client, [string]$urlPath) {
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
         Send-Bytes $client 404 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Not Found')); return
     }
+    # 前缀比较只作用在**字符串**上，不解析重解析点。
+    # 所以 web\ 里如果被放进一个符号链接/联接，它的目标在 web\ 之外也照样会被下发。
+    # 这里补一次实物检查：整条路径上任何一段带 ReparsePoint 属性就拒绝。
+    try {
+        $probe = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if ($probe.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Send-Bytes $client 404 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Not Found')); return
+        }
+    } catch {
+        Send-Bytes $client 404 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Not Found')); return
+    }
     $ext = [System.IO.Path]::GetExtension($full).ToLowerInvariant()
+    # 只下发已知的界面资源类型。以前任何扩展名都会下发，未知类型回落
+    # application/octet-stream —— 也就是 web\ 里出现任何文件都会变成可下载项。
     $mime = $script:MimeTypes[$ext]
-    if (-not $mime) { $mime = 'application/octet-stream' }
+    if (-not $mime) {
+        Send-Bytes $client 404 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Not Found')); return
+    }
     Send-Bytes $client 200 $mime ([System.IO.File]::ReadAllBytes($full))
 }
 
@@ -1514,6 +1764,12 @@ function Handle-Api($client, $req) {
     if ($p -eq '/api/testprint') {
         $b = Get-BodyJson $req
         $printer = [string](Get-Prop $b 'printer' '')
+        # 之前这条路径完全绕过打印机校验，调用者给的字符串会直接进 COM 的 ActivePrinter。
+        # 现在和 /api/print-one 用同一道门。
+        if ($printer -and -not (Test-PrinterExists $printer)) {
+            Send-Json $client ([ordered]@{ ok = $false; detail = "找不到打印机「$printer」" })
+            return
+        }
         $targets = @()
         if ($script:EngineStatus.word) { $targets += 'Word.Application' }
         if ($script:EngineStatus.wps) { $targets += 'KWPS.Application' }
@@ -1532,6 +1788,12 @@ function Handle-Api($client, $req) {
         )
         $tmp = Join-Path $RecordDir ('测试页_' + (Get-Date).ToString('yyyyMMdd_HHmmss') + '.txt')
         [System.IO.File]::WriteAllText($tmp, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+        # 测试页文件也要封顶：以前每点一次"打印测试页"就往打印记录目录里留一个文件，没有上限。
+        try {
+            @(Get-ChildItem -LiteralPath $RecordDir -Filter '测试页_*.txt' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -Skip 10) | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        } catch { }
         $errors = @()
         foreach ($prog in $targets) {
             try {
@@ -1550,18 +1812,28 @@ function Handle-Api($client, $req) {
     if ($p -eq '/api/open') {
         $b = Get-BodyJson $req
         $target = [string](Get-Prop $b 'path' '')
-        # 只允许打开"打印记录目录"或本次扫描过的文件夹，不许拿它当资源管理器用
-        if ([string]::IsNullOrWhiteSpace($target) -or -not (Test-Path -LiteralPath $target)) { $target = $RecordDir }
+        # 只允许打开"打印记录目录"或本次扫描过的文件夹，不许拿它当资源管理器用。
+        # 以前被拒或不存在的路径会被**静默改写成打印记录目录**，于是
+        # "其余一律拒绝"这条腿实际上不存在：调用者以为开的是别处，实际开了这里。
+        # 现在明确报错，并告诉调用者允许的范围。
+        if ([string]::IsNullOrWhiteSpace($target)) { $target = $RecordDir }
         $allowed = @([System.IO.Path]::GetFullPath($RecordDir))
         if ($script:Config.lastFolder -and (Test-Path -LiteralPath $script:Config.lastFolder)) {
             $allowed += [System.IO.Path]::GetFullPath($script:Config.lastFolder)
+        }
+        if (-not (Test-Path -LiteralPath $target)) {
+            Send-Json $client ([ordered]@{ ok = $false; detail = '这个路径不存在' })
+            return
         }
         $full = [System.IO.Path]::GetFullPath($target)
         $okOpen = $false
         foreach ($a in $allowed) {
             if ($full -eq $a -or $full.StartsWith($a + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { $okOpen = $true; break }
         }
-        if (-not $okOpen) { $target = $RecordDir }
+        if (-not $okOpen) {
+            Send-Json $client ([ordered]@{ ok = $false; detail = '只允许打开打印记录目录或本次扫描的文件夹' })
+            return
+        }
         Start-Process explorer.exe -ArgumentList ('"' + $target + '"')
         Send-Json $client ([ordered]@{ ok = $true })
         return
@@ -1584,15 +1856,19 @@ function Handle-Client($client) {
             Send-Bytes $client 400 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Bad Request'))
             return
         }
-        if ($req.tooLarge) {
-            Log '已拦截超大请求体' 'warn'
-            Send-Json $client ([ordered]@{ ok = $false; error = '请求体过大' }) 413
-            return
-        }
+        # 先过请求合法性校验，再处理"请求体过大"。
+        # 之前超限分支排在过滤器之前，于是"超大请求"成了唯一一种
+        # Host / Origin / Content-Type 三项从不被评估的请求形态。
         $bad = Test-RequestAllowed $req
         if ($bad -ne '') {
             Log ("已拦截可疑请求（$bad）：$($req.method) $($req.path)  Host=$($req.headers['host'])  Origin=$($req.headers['origin'])") 'warn'
-            Send-Json $client ([ordered]@{ ok = $false; error = "请求被拒绝（$bad）" }) 403
+            $code = if ($bad -eq 'method') { 405 } else { 403 }
+            Send-Json $client ([ordered]@{ ok = $false; error = "请求被拒绝（$bad）" }) $code
+            return
+        }
+        if ($req.tooLarge) {
+            Log '已拦截超大请求体' 'warn'
+            Send-Json $client ([ordered]@{ ok = $false; error = '请求体过大' }) 413
             return
         }
         $p = $req.path

@@ -307,8 +307,13 @@
         $('placeholder').hidden = true;
         $('scanHint').textContent = '支持 PDF / Word / RTF / TXT';
         render();
-        if (state.files.length === 0) toast('这个文件夹里没有找到简历文件');
-        else if (!silent) toast('扫描完成，共 ' + state.files.length + ' 份，已全部勾选');
+        if (d.truncated && d.truncateNote) {
+          toast(d.truncateNote, true);
+        } else if (state.files.length === 0) {
+          toast('这个文件夹里没有找到简历文件');
+        } else if (!silent) {
+          toast('扫描完成，共 ' + state.files.length + ' 份，已全部勾选');
+        }
       })
       .catch(function (err) {
         toast(err.message, true);
@@ -886,7 +891,12 @@
   };
   $('btnClose').onclick = function () { $('overlay').hidden = true; };
   $('overlay').onclick = function (e) { if (e.target === this && !state.printing) this.hidden = true; };
-  $('btnOpenRec').onclick = function () { api('/api/open', {}); };
+  $('btnOpenRec').onclick = function () {
+    // 服务端现在会在路径不存在或不在允许范围内时明确报错（以前会静默改成打印记录目录）
+    api('/api/open', {}).then(function (d) {
+      if (d && d.ok === false) { toast(d.detail || '打不开这个位置', true); }
+    }).catch(function (e) { toast(e.message, true); });
+  };
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
     if (!$('pagePicker').hidden) { $('pagePicker').hidden = true; return; }

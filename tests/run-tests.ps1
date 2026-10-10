@@ -524,6 +524,82 @@ try {
     Check '超大请求体被拒绝' ($st6 -eq 413 -or $st6 -eq 400 -or $r6 -eq '(连接被重置)') ('返回 ' + $st6)
 
     # --------------------------------------------------------
+    Section '安全：HTTP 方法闸门'
+    # --------------------------------------------------------
+    # 审计发现：Content-Type 闸门以前写在 `if ($req.method -eq 'POST')` 里，
+    # 而分发是按路径的、完全不看方法，于是**不带 Origin 的 GET** 能把三项校验
+    # 全部绕过，而 /api/selftest、/api/testprint、/api/reset-printed 等端点
+    # 空请求体就有破坏性默认行为。现在状态变更端点一律要求 POST。
+
+    foreach ($p in @('/api/reset-printed', '/api/selftest', '/api/fetch-engine', '/api/testprint',
+                     '/api/open', '/api/list-dir', '/api/pagecount', '/api/scan', '/api/print-one',
+                     '/api/end-batch', '/api/restore-printer')) {
+        $r = RawRequest @{ Host = "127.0.0.1:$Port" } 'GET' $p
+        Check "GET $p 被拒（405，不是执行）" ((StatusOf $r) -eq 405) ('返回 ' + (StatusOf $r))
+    }
+
+    $rInfo = RawRequest @{ Host = "127.0.0.1:$Port" } 'GET' '/api/info'
+    Check '只读端点 /api/info 仍允许 GET' ((StatusOf $rInfo) -eq 200) ('返回 ' + (StatusOf $rInfo))
+
+    $rNoCt = RawRequest @{ Host = "127.0.0.1:$Port" } 'POST' '/api/reset-printed'
+    Check 'POST 但没有 Content-Type 被拒' ((StatusOf $rNoCt) -eq 403) ('返回 ' + (StatusOf $rNoCt))
+
+    $rCross = RawRequest @{ Host = "127.0.0.1:$Port"; 'Content-Type' = 'application/json'; 'Sec-Fetch-Site' = 'cross-site' } 'POST' '/api/reset-printed' '{}'
+    Check 'Sec-Fetch-Site: cross-site 被拒（纵深防御）' ((StatusOf $rCross) -eq 403) ('返回 ' + (StatusOf $rCross))
+
+    # 超大请求 + 伪造 Host：过滤器必须**先**跑，所以这里要 403 而不是 413。
+    # 修复前超限分支排在过滤器之前，这是唯一一种绕过全部三项校验的请求形态。
+    $rBigEvil = ''
+    try { $rBigEvil = RawRequest @{ Host = 'evil.example.com'; 'Content-Type' = 'application/json' } 'POST' '/api/scan' $big }
+    catch { $rBigEvil = '(连接被重置)' }
+    $stBigEvil = StatusOf $rBigEvil
+    Check '超大请求也要先过合法性过滤器（非 413）' ($stBigEvil -eq 403) ('返回 ' + $stBigEvil)
+
+    # --------------------------------------------------------
+    Section '安全：输入校验与拒绝语义'
+    # --------------------------------------------------------
+
+    # 打印机存在性以前用 Test-Path 拼注册表路径，而 Test-Path 把 -Path 当通配符模式，
+    # 所以 "*" 这种值也能"通过校验"，然后被拼进 Start-Process 的参数串。
+    foreach ($badPrinter in @('*', 'HP*', '[a-z]*', 'Canon TS300 series"')) {
+        $r = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = $badPrinter; copies = 1; dryRun = $true; enhance = 'normal' }
+        Check ("非法打印机名被拒: " + $badPrinter) ($r.ok -eq $false) ('竟然通过了：' + $r.detail)
+    }
+
+    # /api/open：以前路径不存在或不在允许范围时会被**静默改写成打印记录目录**，
+    # 于是"其余一律拒绝"这条腿实际不存在。现在必须明确报错。
+    $rOpenBad = Api 'POST' '/api/open' @{ path = 'C:\Windows' }
+    Check '/api/open 拒绝范围外的路径（不再静默改写）' ($rOpenBad.ok -eq $false) '竟然返回成功了'
+    $rOpenNo = Api 'POST' '/api/open' @{ path = 'Z:\nope\nope' }
+    Check '/api/open 对不存在路径明确报错' ($rOpenNo.ok -eq $false) '竟然返回成功了'
+
+    # 静态服务：未知扩展名不再回落 application/octet-stream
+    $rExt = RawRequest @{ Host = "127.0.0.1:$Port" } 'GET' '/app.js.bak'
+    Check '静态服务不再下发未知扩展名' ((StatusOf $rExt) -eq 404) ('返回 ' + (StatusOf $rExt))
+    $rJs = RawRequest @{ Host = "127.0.0.1:$Port" } 'GET' '/app.js'
+    Check '静态服务仍正常下发已知资源' ((StatusOf $rJs) -eq 200) ('返回 ' + (StatusOf $rJs))
+    Check '响应带 X-Content-Type-Options: nosniff' ($rJs -match '(?i)X-Content-Type-Options:\s*nosniff')
+
+    # /api/list-dir：快捷入口只在"没指定路径"（停在根）时返回，
+    # 以前无论查哪个目录都会回带桌面/文档/下载的绝对路径。
+    $lsRoot = Api 'POST' '/api/list-dir' @{ path = '' }
+    $lsSub = Api 'POST' '/api/list-dir' @{ path = $resume }
+    Check '/api/list-dir 在根返回快捷入口' (@($lsRoot.shortcuts).Count -gt 0)
+    Check '/api/list-dir 在子目录不泄漏快捷入口' (@($lsSub.shortcuts).Count -eq 0) ('泄漏了 ' + (@($lsSub.shortcuts).Count) + ' 条')
+
+    # 扫描上界字段
+    Check '/api/scan 返回 truncated 标志' ($null -ne $scan.truncated)
+
+    # 页范围：超大数字要被友好拒绝，而不是强转 [int] 抛原始 .NET 异常（500）
+    $rHuge = Api 'POST' '/api/print-one' @{ path = $pdf.path; printer = ''; copies = 1; dryRun = $true; enhance = 'normal'; pages = '9999999999' }
+    Check '超大页码被友好拒绝（不是 500）' ($rHuge.ok -eq $false -and $rHuge.detail -match '太大') $rHuge.detail
+
+    # 原子写：不该留下 .tmp / .bak 残渣
+    $leftovers = @(Get-ChildItem -LiteralPath $tmp -Recurse -File -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like '*.json.tmp' -or $_.Name -like '*.json.bak' -or $_.Name -eq 'config.json.tmp' })
+    Check '原子写没有留下 .tmp / .bak 残渣' ($leftovers.Count -eq 0) ('留下 ' + $leftovers.Count + ' 个')
+
+    # --------------------------------------------------------
     Section '隐私：不在磁盘上乱写'
     # --------------------------------------------------------
 

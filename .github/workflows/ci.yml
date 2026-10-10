@@ -21,8 +21,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      # 用完整 commit SHA 固定 action，不用浮动的 @v4 主标签 ——
+      # 主标签可以被上游移动到任意代码，而 SHA 不可变。
+      # v4.2.2 = 11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Show environment
         shell: powershell
@@ -36,11 +39,12 @@ jobs:
           & .\tools\ci-check-tracked.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # 固定版本，不用 -Force 拉最新；也不再把整个 PSGallery 会话性地标为 Trusted。
       - name: Install PSScriptAnalyzer
         shell: powershell
         run: |
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force -ErrorAction Stop
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -ErrorAction Stop
 
       - name: Static analysis (PSScriptAnalyzer)
         shell: powershell
@@ -64,6 +68,13 @@ jobs:
           & .\tools\ci-fetch-engine.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # 顺带验证打包脚本会不会接受一个哈希不符的引擎（它必须拒绝）。
+      - name: Release packaging rejects an unpinned engine
+        shell: powershell
+        run: |
+          & .\tools\ci-check-engine-pin.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run test suite
         shell: powershell
         run: |
@@ -78,7 +89,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Assert the repo really ships no engine
         shell: powershell

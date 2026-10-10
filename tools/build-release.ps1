@@ -12,8 +12,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = '1.1.0',
-    [switch]$SkipLicenseFetch
+    [string]$Version = '1.2.0',
+    [switch]$SkipLicenseFetch,
+    # 逃生舱：允许把与 server.ps1 固定值不一致的引擎打进包。
+    # 正常情况下**不应该**用它 —— 那条校验就是为了保证包里是受审的那个二进制。
+    [switch]$AllowUnpinnedEngine
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +40,32 @@ if (-not (Test-Path $engine)) {
 }
 $hash = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash
 Write-Host ("  引擎 SHA-256: " + $hash) -ForegroundColor DarkGray
+
+# 把打进包里的引擎和源码里固定的那个哈希对一下。
+# 以前这里只把哈希打印出来、再写进包内说明，**从不比对** ——
+# 于是任何一个放在 bin\ 下的可执行文件都会被当成"官方 3.5.2"打包分发出去，
+# 而消费者没有独立可信根（期望值和实际值都出自同一个未校验的打包步骤）。
+$pinned = $null
+try {
+    $srcText = Get-Content -LiteralPath (Join-Path $RepoRoot 'server.ps1') -Raw -Encoding UTF8
+    $m = [regex]::Match($srcText, "EngineSha256\s*=\s*'([0-9A-Fa-f]{64})'")
+    if ($m.Success) { $pinned = $m.Groups[1].Value.ToUpperInvariant() }
+} catch { }
+if (-not $pinned) {
+    Write-Host '  [X] 读不到 server.ps1 里固定的引擎哈希，拒绝打包。' -ForegroundColor Red
+    exit 1
+}
+if ($hash.ToUpperInvariant() -ne $pinned) {
+    Write-Host '  [X] bin\SumatraPDF.exe 的哈希与 server.ps1 里固定的值不一致：' -ForegroundColor Red
+    Write-Host ("      实际: " + $hash.ToUpperInvariant()) -ForegroundColor Red
+    Write-Host ("      固定: " + $pinned) -ForegroundColor Red
+    Write-Host '      这意味着包里的引擎不是受审的那一个。请重新下载引擎后再打包。' -ForegroundColor Red
+    Write-Host '      （确实要用其它版本时，请显式加 -AllowUnpinnedEngine，风险自负。）' -ForegroundColor Yellow
+    if (-not $AllowUnpinnedEngine) { exit 1 }
+    Write-Host '      -AllowUnpinnedEngine 已指定，继续打包（该包不可宣称使用受审引擎）。' -ForegroundColor Yellow
+} else {
+    Write-Host '  [OK] 引擎哈希与源码固定值一致' -ForegroundColor Green
+}
 
 # ---------- 准备临时目录 ----------
 if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
