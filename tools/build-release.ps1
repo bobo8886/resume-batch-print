@@ -12,7 +12,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = '1.2.0',
+    [string]$Version = '1.2.1',
     [switch]$SkipLicenseFetch,
     # 逃生舱：允许把与 server.ps1 固定值不一致的引擎打进包。
     # 正常情况下**不应该**用它 —— 那条校验就是为了保证包里是受审的那个二进制。

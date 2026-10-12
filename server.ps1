@@ -551,13 +551,29 @@ $script:OfficeOrder = @()
 if ($script:HasWord) { $script:OfficeOrder += 'Word.Application' }
 if ($script:HasWps) { $script:OfficeOrder += 'KWPS.Application' }
 
+# 打印计划里"可以试"的 Office 引擎：按**注册表**判断（$script:HasWord/HasWps），
+# 而不是按"自检有没有探测过"。
+# 这样降级链能把"注册了但没被预探测"的引擎也试一遍，而不用在页面打开时就
+# 为两个引擎各付一次冷启动（约 5.5 秒 × 2）。探测结果只用于界面如实展示。
+function Get-UsableOfficeProgs {
+    $out = @()
+    foreach ($prog in $script:OfficeOrder) {
+        if ($prog -eq 'Word.Application' -and -not $script:HasWord) { continue }
+        if ($prog -like '*KWPS*' -and -not $script:HasWps) { continue }
+        $out += $prog
+    }
+    return $out
+}
+
 function Get-EngineReport {
     [ordered]@{
         sumatra     = [bool]$script:EngineStatus.sumatra
-        word        = [bool]$script:EngineStatus.word
-        wps         = [bool]$script:EngineStatus.wps
+        word        = [bool]($script:EngineStatus.word -or $script:HasWord)
+        wps         = [bool]($script:EngineStatus.wps -or $script:HasWps)
         wordPresent = [bool]$script:HasWord
         wpsPresent  = [bool]$script:HasWps
+        wordVerified = [bool]$script:EngineStatus.word
+        wpsVerified = [bool]$script:EngineStatus.wps
         tested      = [bool]$script:EngineStatus.tested
         message     = [string]$script:EngineStatus.message
         disp        = [bool]$script:EngineStatus.disp
@@ -574,12 +590,19 @@ function Invoke-EngineSelfTest {
         $notes += 'COM 调用助手未能加载'
     } else {
         foreach ($prog in @('Word.Application', 'KWPS.Application')) {
+            # 只要有一个引擎能真的激活起来就够了，**立刻停**。
+            # 第二个引擎只有在前一个失败时才会用到，而那时 Invoke-PrintFile 的降级链
+            # 会自己去试它（计划里用的是注册表结果，见 Get-UsableOfficeProgs）。
+            # 以前两个都探，冷启动下白等约 5.5 秒 —— 而这段等待就发生在页面刚打开、
+            # 用户正准备点「一键打印」的时候。
+            if ($script:EngineStatus.word -or $script:EngineStatus.wps) { break }
             $present = if ($prog -eq 'Word.Application') { $script:HasWord } else { $script:HasWps }
             if (-not $present) { continue }
             $label = if ($prog -like '*KWPS*') { 'WPS' } else { 'Word' }
             $app = $null
             $before = Get-OfficeProcessIds
             $owned = @()
+            $usable = $false
             try {
                 $app = New-Object -ComObject $prog
                 $owned = Get-NewOfficeProcessIds $before
@@ -589,6 +612,7 @@ function Invoke-EngineSelfTest {
                     if ($null -eq $docs) { Start-Sleep -Milliseconds 500 }
                 }
                 if ($null -ne $docs) {
+                    $usable = $true
                     if ($prog -like '*KWPS*') { $script:EngineStatus.wps = $true } else { $script:EngineStatus.word = $true }
                 } else {
                     $notes += "$label 组件响应异常"
@@ -596,12 +620,24 @@ function Invoke-EngineSelfTest {
             } catch {
                 $notes += "$label 不可用"
             } finally {
-                if ($app) { try { [Disp]::Call($app, 'Quit') | Out-Null } catch { }; try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($app) } catch { } }
-                Start-Sleep -Milliseconds 400
-                # 只终止本次自检**自己启动**的进程。
-                # 以前这里是 `Get-Process WINWORD, wps | Stop-Process -Force`，
-                # 会把操作者自己打开、还有未保存内容的文档一起强杀掉。
-                Stop-OfficeProcessId $owned
+                if ($app -and $usable -and -not $script:OfficeApp) {
+                    # 首次成功激活的实例**留着**给打印复用。
+                    # 以前这里无条件 Quit，于是用户第一次打印必须重新冷启动 Word，
+                    # 实测多花约 4.8 秒 —— 而那一刻正是用户盯着进度条的时候。
+                    Set-OfficeSafety $app
+                    $script:OfficeApp = $app
+                    $script:OfficeProgId = $prog
+                    $script:OfficeLastUse = Get-Date
+                    $script:OfficeOwnedPids = $owned
+                } elseif ($app) {
+                    try { [Disp]::Call($app, 'Quit') | Out-Null } catch { }
+                    try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($app) } catch { }
+                    Start-Sleep -Milliseconds 200
+                    # 只终止本次自检**自己启动**的进程。
+                    # 以前这里是 `Get-Process WINWORD, wps | Stop-Process -Force`，
+                    # 会把操作者自己打开、还有未保存内容的文档一起强杀掉。
+                    Stop-OfficeProcessId $owned
+                }
             }
         }
     }
@@ -714,6 +750,9 @@ $script:OfficeProgId = ''
 $script:OfficeLastUse = [datetime]::MinValue
 # 只记录**本工具自己启动**的 Office 进程 id。绝不做"按映像名无差别强杀"。
 $script:OfficeOwnedPids = @()
+# 缓存实例上"已经设过的东西"：换实例时必须清空，否则会把新实例当成设过的。
+$script:OfficeSafetyOptsDone = $false
+$script:OfficePrinterSet = ''
 
 function Get-OfficeProcessIds {
     return @(Get-Process -Name WINWORD, wps -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
@@ -744,6 +783,8 @@ function Close-OfficeApp {
         $script:OfficeProgId = ''
         [GC]::Collect()
     }
+    $script:OfficeSafetyOptsDone = $false
+    $script:OfficePrinterSet = ''
     # Quit 可能被"是否保存"的模态框卡住。这时才需要强杀 —— 但**只杀我们自己起的那个 pid**。
     if ($script:OfficeOwnedPids.Count -gt 0) {
         Start-Sleep -Milliseconds 300
@@ -768,6 +809,9 @@ function Get-OfficeApp([string]$ProgId) {
     $script:OfficeProgId = $ProgId
     $script:OfficeLastUse = $now
     $script:OfficeOwnedPids = Get-NewOfficeProcessIds $before
+    # 新实例：清掉"已经设过"的标记，否则会把新实例当成设过的
+    $script:OfficeSafetyOptsDone = $false
+    $script:OfficePrinterSet = ''
     return $app
 }
 
@@ -798,6 +842,9 @@ function Invoke-SumatraPrint {
 
 function Set-OfficePrinter($App, [string]$Printer) {
     if ([string]::IsNullOrWhiteSpace($Printer)) { return }
+    # 缓存实例上打印目标没变就不用再设一遍。以前每打一份都重设 + 回读，
+    # 一个 20 份的批次白做 40 次 COM 往返。
+    if ($script:OfficePrinterSet -eq $Printer) { return }
     $port = Get-PrinterPortName $Printer
     $lastErr = ''
     foreach ($cand in @("$Printer on $port", $Printer)) {
@@ -810,6 +857,7 @@ function Set-OfficePrinter($App, [string]$Printer) {
         try { $back = [string][Disp]::Get($App, 'ActivePrinter') } catch { continue }
         if ([string]::IsNullOrWhiteSpace($back)) { continue }
         if ($back -ne $Printer -and $back -notlike ($Printer + '*')) { continue }
+        $script:OfficePrinterSet = $Printer
         return
     }
     if ($lastErr) { throw "无法把打印目标切到「$Printer」（$lastErr）" }
@@ -823,13 +871,17 @@ function Set-OfficePrinter($App, [string]$Printer) {
 # 关闭转换确认与警告弹窗。WPS 上没有这些属性时逐项 try/catch 忽略，不影响正常打印。
 function Set-OfficeSafety($App) {
     if ($null -eq $App) { return }
+    # 这两项是安全关键，而且要在每次打开文档之前生效 —— 每份都重设，开销可忽略。
     try { [Disp]::Set($App, 'AutomationSecurity', 3) } catch { }
     try { [Disp]::Set($App, 'DisplayAlerts', 0) } catch { }
+    # Options 里的两项对同一个实例只需设一次（以前每打一份都白设一遍）。
+    if ($script:OfficeSafetyOptsDone) { return }
     try {
         $opts = [Disp]::Get($App, 'Options')
         if ($opts) {
             try { [Disp]::Set($opts, 'UpdateLinksAtOpen', $false) } catch { }
             try { [Disp]::Set($opts, 'ConfirmConversions', $false) } catch { }
+            $script:OfficeSafetyOptsDone = $true
         }
     } catch { }
 }
@@ -954,8 +1006,18 @@ function ConvertTo-EnhancedPdf {
             $page = $doc.GetPage([uint32]$i)
             $pwpt = [double]$page.Size.Width * 0.75     # WinRT 给的是 DIP，换算成 pt
             $phpt = [double]$page.Size.Height * 0.75
-            $reqW = [int][math]::Round($pwpt / 72.0 * 200)   # 实测会被放大到约 300 DPI
-            if ($reqW -lt 800) { $reqW = 800 }
+            # 渲染分辨率：这里请求的像素宽度会被 WinRT 再放大到约 1.5 倍，
+            # 所以请求 133 实际得到的是约 200 DPI。
+            #
+            # 以前请求 200（实际约 300 DPI）。而绝大多数"字很淡"的简历本身
+            # 就是 100~120 DPI 的截图/扫描件 —— 把它渲染到 300 DPI 不会增加
+            # 任何信息，只是凭空多出 2.25 倍的像素，然后逐像素查 gamma 表、
+            # 再做一次 deflate 打包，而这些像素最后还要被打印引擎按 600 DPI
+            # 重新光栅化一遍。实测这是"加深"通道最贵的一段，纯属冗余。
+            # 200 DPI 已经高于源素材分辨率，肉眼无差别。
+            $reqDpi = 133
+            $reqW = [int][math]::Round($pwpt / 72.0 * $reqDpi)
+            if ($reqW -lt 560) { $reqW = 560 }          # 极小的页面给个下限，别糊
             $opts = New-Object Windows.Data.Pdf.PdfPageRenderOptions
             $opts.DestinationWidth = [uint32]$reqW
             $opts.DestinationHeight = [uint32][math]::Round($reqW * $phpt / $pwpt)
@@ -1037,9 +1099,7 @@ function Get-FilePageCount([string]$Path) {
     if ($ext -eq '.pdf') {
         $n = Get-PdfPageCount $Path
     } else {
-        foreach ($prog in $script:OfficeOrder) {
-            if ($prog -eq 'Word.Application' -and -not $script:EngineStatus.word) { continue }
-            if ($prog -like '*KWPS*' -and -not $script:EngineStatus.wps) { continue }
+        foreach ($prog in (Get-UsableOfficeProgs)) {
             $n = Get-OfficePageCount $prog $Path
             if ($n -gt 0) { break }
         }
@@ -1201,9 +1261,7 @@ function Invoke-PrintFile {
     $result['pageCountKnown'] = $pageCountKnown
 
     $usable = @()
-    foreach ($prog in $script:OfficeOrder) {
-        if ($prog -eq 'Word.Application' -and -not $script:EngineStatus.word) { continue }
-        if ($prog -like '*KWPS*' -and -not $script:EngineStatus.wps) { continue }
+    foreach ($prog in (Get-UsableOfficeProgs)) {
         $usable += $prog
     }
 
@@ -1681,7 +1739,24 @@ function Handle-Api($client, $req) {
     }
 
     if ($p -eq '/api/selftest') {
-        Send-Json $client ([ordered]@{ ok = $true; engines = (Invoke-EngineSelfTest) })
+        # 这个端点以前**每次页面加载**都会真的去起一次 Word/WPS 的 COM，
+        # 冷启动实测 5~8 秒；而服务只有一个 worker、串行处理 ——
+        # 用户点「一键打印」时请求就排在这几秒后面，进度条当然卡住；
+        # 点「停止」只是不再发后续请求，取消不了在途的那个，
+        # 所以看起来像"点了停止才开始打印"。
+        #
+        # 现在分两种：
+        #   不强制 → 不做 COM 激活，用注册表 + 引擎文件在毫秒级给出报告；
+        #            真正的 COM 验证推迟到「重新检测」按钮，或第一次 Office 打印
+        #            （Invoke-PrintFile 的降级链本来就会去试）。
+        #   强制   → 才真的起 COM，并缓存结果。
+        $b = Get-BodyJson $req
+        $force = [bool](Get-Prop $b 'force' $false)
+        if ($force) {
+            Send-Json $client ([ordered]@{ ok = $true; engines = (Invoke-EngineSelfTest); verified = $true })
+            return
+        }
+        Send-Json $client ([ordered]@{ ok = $true; engines = (Get-EngineReport); cached = $true })
         return
     }
 
@@ -1745,10 +1820,15 @@ function Handle-Api($client, $req) {
         $pages = [string](Get-Prop $b 'pages' '')
         $clamp = [bool](Get-Prop $b 'pagesClamp' $false)
         if ([string]::IsNullOrWhiteSpace($enh)) { $enh = 'auto' }
+        # 只有真的变了才写盘。以前每打一份就 Save-Config 一次 ——
+        # 一个 20 份的批次会白写 20 次 config.json（每次还是一次原子替换）。
+        $cfgChanged = ([string]$script:Config.printer -ne $printer) -or
+                      ([int]$script:Config.copies -ne $copies) -or
+                      ([string]$script:Config.enhance -ne $enh)
         $script:Config.printer = $printer
         $script:Config.copies = $copies
         $script:Config.enhance = $enh
-        Save-Config
+        if ($cfgChanged) { Save-Config }
         $r = Invoke-PrintFile -Path $path -Printer $printer -Copies $copies -DryRun $dry -Enhance $enh -Pages $pages -ClampPages $clamp
         if ($r.ok -and -not $dry) { Save-Printed }
         Send-Json $client $r
@@ -1770,9 +1850,7 @@ function Handle-Api($client, $req) {
             Send-Json $client ([ordered]@{ ok = $false; detail = "找不到打印机「$printer」" })
             return
         }
-        $targets = @()
-        if ($script:EngineStatus.word) { $targets += 'Word.Application' }
-        if ($script:EngineStatus.wps) { $targets += 'KWPS.Application' }
+        $targets = @(Get-UsableOfficeProgs)
         if ($targets.Count -eq 0) {
             Send-Json $client ([ordered]@{ ok = $false; detail = '没有可用的 Word/WPS，测不了测试页；可以直接试打一份 PDF 简历' })
             return

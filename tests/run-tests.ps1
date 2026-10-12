@@ -327,8 +327,19 @@ try {
         Check '缺引擎时 engineMissing = true' ($info.engineMissing -eq $true)
     }
 
-    $st = Api 'POST' '/api/selftest' @{}
-    Check '/api/selftest 返回引擎报告' ($null -ne $st.engines)
+    # ---- 自检的两种模式 ----------------------------------------------------
+    # 不强制 → 毫秒级返回，**不做 COM 激活**（否则每次页面加载白等 5~8 秒，
+    #          还会占住唯一的 worker，让用户紧接着点的「一键打印」排队）。
+    # 强制   → 才真的起 COM，并回写 tested / *Verified。
+    $swFast = [Diagnostics.Stopwatch]::StartNew()
+    $stFast = Api 'POST' '/api/selftest' @{}
+    $swFast.Stop()
+    Check '/api/selftest 返回引擎报告' ($null -ne $stFast.engines)
+    Check '不强制时不做 COM 激活（无 tested 回写）' ($stFast.engines.tested -eq $false) '竟然做了真实自检'
+    Check '不强制时在毫秒级返回（<1500ms）' ($swFast.ElapsedMilliseconds -lt 1500) ("耗时 " + $swFast.ElapsedMilliseconds + " ms")
+
+    $st = Api 'POST' '/api/selftest' @{ force = $true }
+    Check '强制自检返回引擎报告' ($null -ne $st.engines)
 
     # 自检之后引擎状态才会变成真实结果，这里必须重新取一次 info，
     # 否则拿到的是"还没检测"的旧值（全 false）。
@@ -336,7 +347,12 @@ try {
     if ($hasEngine) {
         Check '自检后引擎被标记为可用' ($info.engines.sumatra -eq $true) '有引擎但报告不可用'
     }
-    Check '自检后 tested = true' ($info.engines.tested -eq $true) 'selftest 没有回写状态'
+    Check '强制自检后 tested = true' ($info.engines.tested -eq $true) 'selftest 没有回写状态'
+
+    $swAgain = [Diagnostics.Stopwatch]::StartNew()
+    $stAgain = Api 'POST' '/api/selftest' @{}
+    $swAgain.Stop()
+    Check '再次调用不强制自检仍然很快（<1500ms）' ($swAgain.ElapsedMilliseconds -lt 1500) ("耗时 " + $swAgain.ElapsedMilliseconds + " ms")
 
     $dir = Api 'POST' '/api/list-dir' @{ path = '' }
     Check '/api/list-dir 根目录返回驱动器' ((@($dir.drives)).Count -gt 0)

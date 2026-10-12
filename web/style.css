@@ -301,6 +301,9 @@ tbody input[type=checkbox],thead input[type=checkbox]{
 .log .l-ok{color:#6ee7a8}
 .log .l-err{color:#ff8f85}
 .log .l-info{color:#8ab4f8}
+.log .l-run{color:#ffd479;font-weight:600}
+.log .l-run::after{content:'▍';margin-left:2px;animation:rbp-blink 1s steps(2,start) infinite}
+@keyframes rbp-blink{to{visibility:hidden}}
 .modal-foot{display:flex;gap:10px;margin-top:16px;justify-content:flex-end}
 
 /* ---------- 文件夹浏览器 ---------- */

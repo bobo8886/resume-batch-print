@@ -153,9 +153,11 @@
     box.innerHTML = html;
   }
 
-  function runSelfTest(silent) {
-    if (!state.tested) { renderEngines(true); }
-    return api('/api/selftest', {}).then(function (d) {
+  // 自检：force=true 才真的去起 Word/WPS 的 COM（约 5 秒），否则服务端直接回缓存结果。
+  // 页面加载时用缓存（服务端可能已经检测过），只有用户点「重新检测」才强制重跑。
+  function runSelfTest(silent, force) {
+    if (force && !silent) { renderEngines(true); }
+    return api('/api/selftest', force ? { force: true } : {}).then(function (d) {
       state.tested = true;
       state.info = state.info || {};
       state.info.engines = d.engines;
@@ -636,6 +638,30 @@
     d.textContent = text;
     box.appendChild(d);
     box.scrollTop = box.scrollHeight;
+    return d;
+  }
+
+  // 当前正在处理的那一行。
+  // 以前只在整个请求**返回之后**才写日志 —— 打印一页要 0.5~3 秒，这段时间界面上
+  // 一个字都不变，看起来就是"卡住"。现在请求发出前先把这一行写上，并每 250ms
+  // 刷新一次已用秒数，让用户看得见东西在动。
+  var pendingLine = null, tickTimer = null, pendingStart = 0, pendingName = '';
+  function pendingTick() {
+    if (!pendingLine) return;
+    var s = ((Date.now() - pendingStart) / 1000).toFixed(1);
+    pendingLine.textContent = '⏳ ' + pendingName + '　已用 ' + s + ' 秒…';
+  }
+  function pendingStartOn(name) {
+    pendingName = name;
+    pendingStart = Date.now();
+    if (!pendingLine) { pendingLine = logLine('', 'l-run'); }
+    pendingTick();
+    if (!tickTimer) { tickTimer = setInterval(pendingTick, 250); }
+  }
+  function pendingEnd() {
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+    if (pendingLine && pendingLine.parentNode) { pendingLine.parentNode.removeChild(pendingLine); }
+    pendingLine = null;
   }
 
   function printList(paths) {
@@ -694,8 +720,10 @@
       }
       if (spec) { logLine('  ' + name + '　（第 ' + spec + ' 页）', 'l-info'); }
 
+      pendingStartOn(name);
       api('/api/print-one', pay)
         .then(function (r) {
+          pendingEnd();
           if (r.ok) {
             okCount++;
             state.result[path] = dry ? 'dry' : 'ok';
@@ -707,6 +735,7 @@
           }
         })
         .catch(function (err) {
+          pendingEnd();
           failCount++;
           state.result[path] = 'err';
           logLine('✘ ' + name + '　→ ' + err.message, 'l-err');
@@ -715,6 +744,7 @@
     }
 
     function finish(stopped) {
+      pendingEnd();
       state.printing = false;
       $('bar').style.width = '100%';
       var sec = ((Date.now() - t0) / 1000).toFixed(1);
@@ -745,7 +775,7 @@
   $('btnScan').onclick = function () { scan(); };
   $('folder').onkeydown = function (e) { if (e.key === 'Enter') scan(); };
   $('recursive').onchange = function () { if (state.folder) scan(true); };
-  $('btnRetest').onclick = function () { runSelfTest(false); };
+  $('btnRetest').onclick = function () { runSelfTest(false, true); };
 
   var btnFetch = $('btnFetchEngine');
   if (btnFetch) {
